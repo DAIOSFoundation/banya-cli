@@ -61,8 +61,8 @@ var taglineRunes = []rune(taglineText)
 
 // Animation intervals
 const (
-	bannerAnimInterval  = 76 * time.Millisecond // 25 lines × 76ms ≈ 1.9s
-	taglineAnimInterval = 40 * time.Millisecond // typewriter speed per character
+	bannerAnimInterval  = 50 * time.Millisecond // 25 lines × 50ms ≈ 1.25s (1.5× speed)
+	taglineAnimInterval = 26 * time.Millisecond // typewriter speed per character (1.5× speed)
 )
 
 // bannerTickMsg drives the line-by-line drop animation.
