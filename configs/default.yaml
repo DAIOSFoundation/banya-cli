@@ -1,0 +1,56 @@
+# Banya CLI Configuration
+# Copy this file to ~/.config/banya/config.yaml
+
+server:
+  # Code agent server URL
+  url: "http://localhost:8080"
+  # API key (can also be set via BANYA_SERVER_API_KEY env var or `banya login`)
+  api_key: ""
+
+ui:
+  # Theme: dark, light
+  theme: "dark"
+  # Show token usage in status bar
+  show_tokens: true
+  # Word wrap for long content
+  word_wrap: true
+  # Max width (0 = auto, uses terminal width)
+  max_width: 0
+
+shell:
+  # Auto-approve low-risk commands without prompting
+  auto_approve: false
+  # Commands that never require approval
+  allowed_commands:
+    - ls
+    - cat
+    - head
+    - tail
+    - wc
+    - pwd
+    - whoami
+    - date
+    - echo
+    - grep
+    - find
+    - tree
+    - git status
+    - git log
+    - git diff
+    - go version
+    - node --version
+    - python3 --version
+  # Commands that are always blocked
+  blocked_commands:
+    - "rm -rf /"
+    - "mkfs"
+    - "dd if=/dev/zero"
+    - ":(){ :|:&};:"
+  # Shell to use (empty = $SHELL or /bin/bash)
+  shell: ""
+
+log:
+  # Log level: debug, info, warn, error
+  level: "info"
+  # Log file path (empty = stderr only)
+  file: ""
