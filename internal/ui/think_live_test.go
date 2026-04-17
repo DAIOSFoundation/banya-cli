@@ -37,8 +37,8 @@ func TestCollapseThink_liveStreaming(t *testing.T) {
 	if seenPlainCoT {
 		t.Fatal("live CoT tokens were rendered in clear before </think>")
 	}
-	if !strings.Contains(finalView, thinkPlaceholder) {
-		t.Fatalf("final view missing placeholder:\n%s", finalView)
+	if strings.Contains(finalView, thinkPlaceholder) {
+		t.Fatalf("final view still shows placeholder after </think>:\n%s", finalView)
 	}
 	if !strings.Contains(finalView, "안녕하세요") {
 		t.Fatalf("final view missing real answer:\n%s", finalView)

@@ -4,7 +4,7 @@ import "testing"
 
 func TestCollapseThink_pairedTags(t *testing.T) {
 	got := collapseThink("<think>reasoning here</think>\n\nFinal answer")
-	want := thinkPlaceholder + "Final answer"
+	want := "Final answer"
 	if got != want {
 		t.Fatalf("got %q, want %q", got, want)
 	}
@@ -12,7 +12,7 @@ func TestCollapseThink_pairedTags(t *testing.T) {
 
 func TestCollapseThink_orphanClose(t *testing.T) {
 	got := collapseThink("Thinking Process...\nstep 1\n</think>\n\nFinal answer")
-	want := thinkPlaceholder + "Final answer"
+	want := "Final answer"
 	if got != want {
 		t.Fatalf("got %q, want %q", got, want)
 	}
@@ -20,7 +20,7 @@ func TestCollapseThink_orphanClose(t *testing.T) {
 
 func TestCollapseThink_unclosed(t *testing.T) {
 	got := collapseThink("Answer begins <think>still reasoning")
-	want := "Answer begins " + thinkPlaceholder
+	want := "Answer begins\n\n" + thinkPlaceholder
 	if got != want {
 		t.Fatalf("got %q, want %q", got, want)
 	}
@@ -30,15 +30,15 @@ func TestCollapseThink_partialTagSuffix(t *testing.T) {
 	// Delta stream ends mid-tag; we should hide the partial prefix.
 	for _, partial := range []string{"<", "<t", "<th", "<thi", "<thin", "<think"} {
 		got := collapseThink("Before " + partial)
-		if got != "Before " {
-			t.Fatalf("partial=%q got %q, want %q", partial, got, "Before ")
+		if got != "Before" {
+			t.Fatalf("partial=%q got %q, want %q", partial, got, "Before")
 		}
 	}
 }
 
 func TestCollapseThink_multipleBlocks(t *testing.T) {
 	got := collapseThink("<think>a</think>foo<think>b</think>bar")
-	want := thinkPlaceholder + "foo" + thinkPlaceholder + "bar"
+	want := "foobar"
 	if got != want {
 		t.Fatalf("got %q, want %q", got, want)
 	}

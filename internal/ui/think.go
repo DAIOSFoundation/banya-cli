@@ -46,6 +46,14 @@ func collapseThink(raw string) string {
 
 // collapseThinkWithPlaceholder is collapseThink with a caller-supplied
 // placeholder (e.g. an animated "thinking..." frame).
+//
+// Rendering rules:
+//   - while inside an open think block (CoT still streaming): show the
+//     placeholder ONLY — no real content is displayed yet
+//   - once the think block is closed and real content follows: show the
+//     real content ONLY — the placeholder is dropped entirely
+//   - mixed case (real text before an unclosed think): real text plus a
+//     trailing placeholder to signal ongoing reasoning
 func collapseThinkWithPlaceholder(raw string, placeholder string) string {
 	if raw == "" {
 		return raw
@@ -58,43 +66,44 @@ func collapseThinkWithPlaceholder(raw string, placeholder string) string {
 	if closeIdx >= 0 && (openIdx < 0 || closeIdx < openIdx) {
 		raw = "<think>" + raw
 	} else if openIdx < 0 && hasImplicitThinkIntro(raw) {
-		// No </think> yet, but the stream opens with a reasoning intro —
-		// wrap it so the block is collapsed live. If the stream later
-		// turns out to contain </think>, the first branch above would
-		// have caught it on a subsequent render; if it never does, the
-		// placeholder keeps the UI quiet and the buffered reasoning is
-		// dropped by the unclosed-branch below.
 		raw = "<think>" + raw
 	}
 
-	var out strings.Builder
+	var real strings.Builder
+	insideUnclosed := false
+
 	for {
 		i := strings.Index(raw, "<think>")
 		if i < 0 {
-			out.WriteString(raw)
+			real.WriteString(raw)
 			break
 		}
-		out.WriteString(raw[:i])
-		out.WriteString(placeholder)
+		real.WriteString(raw[:i])
 		raw = raw[i+len("<think>"):]
 
 		j := strings.Index(raw, "</think>")
 		if j < 0 {
-			// Unclosed — drop the rest; the placeholder already indicates it.
+			// Still inside — no more real content after this.
+			insideUnclosed = true
 			raw = ""
 			break
 		}
 		raw = raw[j+len("</think>"):]
-		// Tidy the newline noise models tend to emit around the closing tag.
 		raw = strings.TrimLeft(raw, " \t\r\n")
 	}
 
-	result := out.String()
-
-	// Hide a dangling partial tag prefix so the user doesn't briefly see
-	// "<th" before the next delta completes it.
+	result := real.String()
 	result = trimTagPrefixSuffix(result, "<think>")
 	result = trimTagPrefixSuffix(result, "</think>")
+	result = strings.TrimSpace(result)
+
+	if insideUnclosed {
+		if result == "" {
+			return placeholder
+		}
+		return result + "\n\n" + placeholder
+	}
+	// Fully past any think blocks — return just the real content.
 	return result
 }
 
