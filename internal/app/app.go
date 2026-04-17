@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/cascadecodes/banya-cli/internal/audio"
 	"github.com/cascadecodes/banya-cli/internal/client"
 	"github.com/cascadecodes/banya-cli/internal/config"
 	"github.com/cascadecodes/banya-cli/internal/setup"
@@ -53,6 +54,10 @@ func Run(cfg *config.Config) error {
 
 	fmt.Fprint(os.Stdout, setBlackBg+setGreenFg)
 	defer fmt.Fprint(os.Stdout, resetColors)
+
+	// Start the Buddha banner chime asynchronously. Missing audio
+	// player or errors are silent — never blocks TUI startup.
+	audio.PlayStart()
 
 	model := ui.New(apiClient, cfg)
 	p := tea.NewProgram(model, tea.WithAltScreen())
