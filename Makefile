@@ -47,6 +47,10 @@ install: build
 	mkdir -p "$$PREFIX"; \
 	cp "$(BUILD_DIR)/$(APP_NAME)" "$$PREFIX/$(APP_NAME)"; \
 	chmod +x "$$PREFIX/$(APP_NAME)"; \
+	if [ "$$(uname -s)" = "Darwin" ]; then \
+		codesign --force --sign - "$$PREFIX/$(APP_NAME)" 2>/dev/null || true; \
+		xattr -d com.apple.quarantine "$$PREFIX/$(APP_NAME)" 2>/dev/null || true; \
+	fi; \
 	echo "installed $$PREFIX/$(APP_NAME)"; \
 	if [ -z "$$NO_ALIAS" ]; then \
 		sh scripts/register-alias.sh "$$PREFIX/$(APP_NAME)"; \
