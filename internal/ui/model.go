@@ -92,7 +92,7 @@ func New(apiClient client.Client, cfg *config.Config) Model {
 	s.Spinner = spinner.Dot
 	s.Style = theme.Spinner
 
-	return Model{
+	m := Model{
 		state:      StateReady,
 		sessionID:  uuid.New().String(),
 		messages:   make([]protocol.Message, 0),
@@ -113,6 +113,8 @@ func New(apiClient client.Client, cfg *config.Config) Model {
 		debugHeight:  defaultDebugPanelHeight,
 		promptMode:   resolvePromptMode(cfg.PromptMode),
 	}
+	m.initStatusFromConfig()
+	return m
 }
 
 // resolvePromptMode normalises config-provided prompt modes and falls
@@ -125,6 +127,12 @@ func resolvePromptMode(raw string) protocol.PromptType {
 	return protocol.PromptAgent
 }
 
+// initStatusFromConfig pushes the initial prompt mode into the status
+// bar so it shows the right segment from first paint.
+func (m *Model) initStatusFromConfig() {
+	m.statusBar.SetPromptMode(string(m.promptMode))
+}
+
 // CurrentPromptMode exposes the active prompt mode for slash commands.
 func (m *Model) CurrentPromptMode() protocol.PromptType { return m.promptMode }
 
@@ -134,6 +142,7 @@ func (m *Model) SetPromptMode(mode protocol.PromptType) error {
 	switch mode {
 	case protocol.PromptCode, protocol.PromptAsk, protocol.PromptPlan, protocol.PromptAgent:
 		m.promptMode = mode
+		m.statusBar.SetPromptMode(string(mode))
 		return nil
 	}
 	return fmt.Errorf("invalid prompt mode: %s", mode)

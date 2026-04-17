@@ -42,12 +42,13 @@ var (
 
 // StatusBar renders the Oh My Posh–style powerline status bar.
 type StatusBar struct {
-	theme     styles.Theme
-	width     int
-	connected bool
-	model     string
-	session   string
-	tokens    int
+	theme      styles.Theme
+	width      int
+	connected  bool
+	model      string
+	session    string
+	tokens     int
+	promptMode string
 }
 
 // NewStatusBar creates a new status bar.
@@ -63,6 +64,7 @@ func (s *StatusBar) SetConnected(c bool)        { s.connected = c }
 func (s *StatusBar) SetModel(m string)          { s.model = m }
 func (s *StatusBar) SetSession(ss string)       { s.session = ss }
 func (s *StatusBar) SetTokens(t int)            { s.tokens = t }
+func (s *StatusBar) SetPromptMode(m string)     { s.promptMode = m }
 
 // View renders the powerline status bar.
 func (s StatusBar) View() string {
@@ -111,11 +113,27 @@ func (s StatusBar) View() string {
 		Background(seg4Bg).Foreground(seg4Fg).
 		Padding(0, 1).
 		Render("⏍ " + sessID)
-	seg4Sep := lipgloss.NewStyle().
-		Foreground(seg4Bg).Background(seg5Bg).
+
+	// Seg5: prompt mode (purple bg)
+	modeBg := lipgloss.Color("#5e3ec5")
+	modeFg := lipgloss.Color("#FFFFFF")
+	mode := s.promptMode
+	if mode == "" {
+		mode = "agent"
+	}
+	modeIcon := promptModeIcon(mode)
+	seg5ModeContent := lipgloss.NewStyle().
+		Background(modeBg).Foreground(modeFg).Bold(true).
+		Padding(0, 1).
+		Render(modeIcon + " " + mode)
+	seg4ToModeSep := lipgloss.NewStyle().
+		Foreground(seg4Bg).Background(modeBg).
+		Render(plRight)
+	modeToTimeSep := lipgloss.NewStyle().
+		Foreground(modeBg).Background(seg5Bg).
 		Render(plRight)
 
-	// Seg5: time
+	// Seg6: time
 	now := time.Now().Format("15:04")
 	seg5Content := lipgloss.NewStyle().
 		Background(seg5Bg).Foreground(seg5Fg).
@@ -128,7 +146,8 @@ func (s StatusBar) View() string {
 	left := seg1Content + seg1Sep +
 		seg2Content + seg2Sep +
 		seg3Content + seg3Sep +
-		seg4Content + seg4Sep +
+		seg4Content + seg4ToModeSep +
+		seg5ModeContent + modeToTimeSep +
 		seg5Content + seg5Sep
 
 	// Fill remaining width with black
@@ -140,6 +159,21 @@ func (s StatusBar) View() string {
 	fill := strings.Repeat(" ", remaining)
 
 	return left + fill
+}
+
+// promptModeIcon returns a glyph for each prompt mode.
+func promptModeIcon(mode string) string {
+	switch mode {
+	case "agent":
+		return "🤖"
+	case "code":
+		return "</>"
+	case "plan":
+		return "📋"
+	case "ask":
+		return "💬"
+	}
+	return "•"
 }
 
 // shortPath returns a shortened working directory path.
