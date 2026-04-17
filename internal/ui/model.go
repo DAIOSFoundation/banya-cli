@@ -1,6 +1,7 @@
 package ui
 
 import (
+	"fmt"
 	"os"
 	"time"
 
@@ -77,6 +78,10 @@ type Model struct {
 
 	// Thinking animation frame counter (cycles while streaming)
 	thinkingFrame int
+
+	// Active prompt mode (code | ask | plan | agent). Selects which
+	// system prompt Core composes for each chat turn.
+	promptMode protocol.PromptType
 }
 
 // New creates a new TUI model.
@@ -106,7 +111,32 @@ func New(apiClient client.Client, cfg *config.Config) Model {
 		taglineChars: -1,
 		debugBuf:     newDebugBuffer(),
 		debugHeight:  defaultDebugPanelHeight,
+		promptMode:   resolvePromptMode(cfg.PromptMode),
 	}
+}
+
+// resolvePromptMode normalises config-provided prompt modes and falls
+// back to "agent" for anything unrecognised (including empty).
+func resolvePromptMode(raw string) protocol.PromptType {
+	switch protocol.PromptType(raw) {
+	case protocol.PromptCode, protocol.PromptAsk, protocol.PromptPlan, protocol.PromptAgent:
+		return protocol.PromptType(raw)
+	}
+	return protocol.PromptAgent
+}
+
+// CurrentPromptMode exposes the active prompt mode for slash commands.
+func (m *Model) CurrentPromptMode() protocol.PromptType { return m.promptMode }
+
+// SetPromptMode switches the active prompt mode. Only the four known
+// values are accepted.
+func (m *Model) SetPromptMode(mode protocol.PromptType) error {
+	switch mode {
+	case protocol.PromptCode, protocol.PromptAsk, protocol.PromptPlan, protocol.PromptAgent:
+		m.promptMode = mode
+		return nil
+	}
+	return fmt.Errorf("invalid prompt mode: %s", mode)
 }
 
 // Init sets up initial commands.
@@ -135,9 +165,10 @@ func (m Model) sendMessage(content string) tea.Cmd {
 	return func() tea.Msg {
 		wd, _ := os.Getwd()
 		req := protocol.ChatRequest{
-			SessionID: m.sessionID,
-			Message:   content,
-			WorkDir:   wd,
+			SessionID:  m.sessionID,
+			Message:    content,
+			WorkDir:    wd,
+			PromptType: m.promptMode,
 			Metadata: &protocol.Metadata{
 				OS:    "linux",
 				Shell: m.cfg.Shell.Shell,

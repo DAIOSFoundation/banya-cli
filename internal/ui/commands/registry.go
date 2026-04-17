@@ -15,6 +15,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/cascadecodes/banya-cli/internal/client"
 	"github.com/cascadecodes/banya-cli/internal/config"
+	"github.com/cascadecodes/banya-cli/pkg/protocol"
 )
 
 // Context bundles the state a command handler may need.
@@ -22,6 +23,12 @@ type Context struct {
 	Client    client.Client
 	Config    *config.Config
 	SessionID string
+
+	// PromptMode returns the currently active prompt mode.
+	PromptMode func() protocol.PromptType
+	// SetPromptMode changes the active prompt mode. Returns an error for
+	// invalid values; valid ones are code / ask / plan / agent.
+	SetPromptMode func(protocol.PromptType) error
 }
 
 // Result describes what the UI should show after a command runs.

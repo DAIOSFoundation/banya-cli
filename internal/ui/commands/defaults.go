@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"github.com/cascadecodes/banya-cli/internal/client"
+	"github.com/cascadecodes/banya-cli/pkg/protocol"
 	"github.com/google/uuid"
 )
 
@@ -49,13 +50,19 @@ func (r *Registry) registerDefaults() {
 	})
 	r.Register(&Command{
 		Name:    "mode",
-		Summary: "Print the active client mode (sidecar / remote)",
+		Usage:   "/mode [code|ask|plan|agent]",
+		Summary: "Switch (or show) the active prompt mode",
+		Handler: promptModeHandler,
+	})
+	r.Register(&Command{
+		Name:    "transport",
+		Summary: "Print the active transport (sidecar / remote)",
 		Handler: func(ctx Context, _ []string) Result {
 			mode := ctx.Config.Mode
 			if mode == "" {
 				mode = "sidecar"
 			}
-			return Result{Output: "mode: " + mode}
+			return Result{Output: "transport: " + mode}
 		},
 	})
 	r.Register(&Command{
@@ -93,6 +100,31 @@ func (r *Registry) registerDefaults() {
 		Summary: "Print client + protocol version",
 		Handler: versionHandler,
 	})
+}
+
+func promptModeHandler(ctx Context, args []string) Result {
+	current := protocol.PromptAsk
+	if ctx.PromptMode != nil {
+		current = ctx.PromptMode()
+	}
+	if len(args) == 0 {
+		return Result{Output: "prompt mode: " + string(current) +
+			"  (choices: code | ask | plan | agent)"}
+	}
+	next := protocol.PromptType(strings.ToLower(args[0]))
+	switch next {
+	case protocol.PromptCode, protocol.PromptAsk, protocol.PromptPlan, protocol.PromptAgent:
+		if ctx.SetPromptMode == nil {
+			return Result{Output: "prompt mode setter not wired in this client"}
+		}
+		if err := ctx.SetPromptMode(next); err != nil {
+			return Result{Output: "failed to switch mode: " + err.Error()}
+		}
+		return Result{Output: "prompt mode → " + string(next)}
+	default:
+		return Result{Output: "unknown mode: " + args[0] +
+			"  (want code | ask | plan | agent)"}
+	}
 }
 
 func (r *Registry) helpHandler(_ Context, _ []string) Result {

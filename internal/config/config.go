@@ -16,13 +16,14 @@ import (
 
 // Config holds the complete application configuration.
 type Config struct {
-	Mode      string          `mapstructure:"mode"` // "sidecar" (default), "remote", "llm-server"
-	Sidecar   SidecarConfig   `mapstructure:"sidecar"`
-	Server    ServerConfig    `mapstructure:"server"`
-	LLMServer LLMServerConfig `mapstructure:"llm_server"`
-	UI        UIConfig        `mapstructure:"ui"`
-	Shell     ShellConfig     `mapstructure:"shell"`
-	Log       LogConfig       `mapstructure:"log"`
+	Mode       string          `mapstructure:"mode"` // "sidecar" (default), "remote"
+	PromptMode string          `mapstructure:"prompt_mode"` // code | ask | plan | agent (default: agent)
+	Sidecar    SidecarConfig   `mapstructure:"sidecar"`
+	Server     ServerConfig    `mapstructure:"server"`
+	LLMServer  LLMServerConfig `mapstructure:"llm_server"`
+	UI         UIConfig        `mapstructure:"ui"`
+	Shell      ShellConfig     `mapstructure:"shell"`
+	Log        LogConfig       `mapstructure:"log"`
 }
 
 // SidecarConfig controls how the CLI locates and runs the banya-core sidecar binary.
@@ -91,6 +92,7 @@ func Load() (*Config, error) {
 
 	// Defaults
 	v.SetDefault("mode", "sidecar")
+	v.SetDefault("prompt_mode", "agent")
 	v.SetDefault("sidecar.path", "")
 	v.SetDefault("server.url", "http://localhost:8080")
 	v.SetDefault("server.api_key", "")

@@ -21,7 +21,8 @@ func main() {
 	}
 
 	// Global flags
-	rootCmd.PersistentFlags().String("mode", "", "Client mode: sidecar (default) | remote")
+	rootCmd.PersistentFlags().String("mode", "", "Transport mode: sidecar (default) | remote")
+	rootCmd.PersistentFlags().String("prompt-mode", "", "Prompt mode: code | ask | plan | agent (default: agent)")
 	rootCmd.PersistentFlags().String("sidecar", "", "Path to banya-core sidecar binary (sidecar mode only)")
 	rootCmd.PersistentFlags().String("llm-url", "", "llm-server base URL (llm-server/sidecar modes)")
 	rootCmd.PersistentFlags().String("llm-key", "", "llm-server API key (llm-server/sidecar modes)")
@@ -54,6 +55,9 @@ func runChat(cmd *cobra.Command, args []string) error {
 	// Apply CLI flag overrides
 	if m, _ := cmd.Flags().GetString("mode"); m != "" {
 		cfg.Mode = m
+	}
+	if pm, _ := cmd.Flags().GetString("prompt-mode"); pm != "" {
+		cfg.PromptMode = pm
 	}
 	if sc, _ := cmd.Flags().GetString("sidecar"); sc != "" {
 		cfg.Sidecar.Path = sc
@@ -147,7 +151,8 @@ func configCmd() *cobra.Command {
 				return
 			}
 			fmt.Printf("Config file:    %s\n", config.ConfigFilePath())
-			fmt.Printf("Mode:           %s\n", cfg.Mode)
+			fmt.Printf("Transport:      %s\n", cfg.Mode)
+			fmt.Printf("Prompt mode:    %s\n", cfg.PromptMode)
 			fmt.Printf("Sidecar path:   %s\n", cfg.Sidecar.Path)
 			fmt.Printf("LLM server URL: %s\n", cfg.LLMServer.URL)
 			fmt.Printf("LLM model:      %s\n", cfg.LLMServer.Model)

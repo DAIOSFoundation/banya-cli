@@ -42,13 +42,25 @@ const (
 
 // --- Request types ---
 
+// PromptType selects the system prompt Core will compose for the turn.
+// Short names: "code" | "ask" | "plan" | "agent".
+type PromptType string
+
+const (
+	PromptCode  PromptType = "code"
+	PromptAsk   PromptType = "ask"
+	PromptPlan  PromptType = "plan"
+	PromptAgent PromptType = "agent"
+)
+
 // ChatRequest is the payload sent by the CLI to start or continue a conversation.
 type ChatRequest struct {
-	SessionID string    `json:"session_id,omitempty"`
-	Message   string    `json:"message"`
-	Files     []string  `json:"files,omitempty"`
-	WorkDir   string    `json:"work_dir,omitempty"`
-	Metadata  *Metadata `json:"metadata,omitempty"`
+	SessionID  string     `json:"session_id,omitempty"`
+	Message    string     `json:"message"`
+	Files      []string   `json:"files,omitempty"`
+	WorkDir    string     `json:"work_dir,omitempty"`
+	PromptType PromptType `json:"prompt_type,omitempty"`
+	Metadata   *Metadata  `json:"metadata,omitempty"`
 }
 
 // ApprovalResponse is sent when the user approves or denies a tool call.

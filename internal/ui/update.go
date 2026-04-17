@@ -15,6 +15,12 @@ func (m Model) runSlashCommand(line string) (tea.Model, tea.Cmd) {
 		Client:    m.client,
 		Config:    m.cfg,
 		SessionID: m.sessionID,
+		PromptMode: func() protocol.PromptType {
+			return m.promptMode
+		},
+		SetPromptMode: func(mode protocol.PromptType) error {
+			return (&m).SetPromptMode(mode)
+		},
 	}
 	res := m.commands.Dispatch(line, ctx)
 
