@@ -26,3 +26,4 @@ auth.json
 
 # Embedded sidecar binaries (populated by build, not committed)
 internal/client/embedded_sidecar/banya-core-*
+start.mp3
