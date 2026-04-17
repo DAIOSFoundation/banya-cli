@@ -32,12 +32,15 @@ const (
 
 // LlmChatParams is the payload the sidecar sends on `llm.chat`.
 type LlmChatParams struct {
+	SessionID   string           `json:"session_id,omitempty"`
 	Messages    []LlmChatMessage `json:"messages"`
 	Model       string           `json:"model,omitempty"`
 	MaxTokens   int              `json:"max_tokens,omitempty"`
 	Temperature float64          `json:"temperature,omitempty"`
 	TopP        float64          `json:"top_p,omitempty"`
 	Stream      bool             `json:"stream,omitempty"`
+	Tools       []LlmToolSpec    `json:"tools,omitempty"`
+	ToolChoice  any              `json:"tool_choice,omitempty"`
 }
 
 // LlmChatMessage is a single message in an `llm.chat` request.
@@ -46,10 +49,31 @@ type LlmChatMessage struct {
 	Content string      `json:"content"`
 }
 
+// LlmToolSpec is an OpenAI-compatible function-calling tool definition.
+type LlmToolSpec struct {
+	Type     string             `json:"type"` // always "function"
+	Function LlmToolSpecFunction `json:"function"`
+}
+
+// LlmToolSpecFunction holds the function metadata.
+type LlmToolSpecFunction struct {
+	Name        string         `json:"name"`
+	Description string         `json:"description,omitempty"`
+	Parameters  map[string]any `json:"parameters,omitempty"`
+}
+
+// LlmToolCall is a model-emitted function invocation.
+type LlmToolCall struct {
+	ID        string `json:"id"`
+	Name      string `json:"name"`
+	Arguments string `json:"arguments"`
+}
+
 // LlmChatResult is the final response the host returns for `llm.chat`.
 type LlmChatResult struct {
-	Content      string `json:"content"`
-	FinishReason string `json:"finish_reason,omitempty"`
+	Content      string        `json:"content"`
+	FinishReason string        `json:"finish_reason,omitempty"`
+	ToolCalls    []LlmToolCall `json:"tool_calls,omitempty"`
 }
 
 // LlmCancelParams tells the host to cancel an in-flight llm.chat.

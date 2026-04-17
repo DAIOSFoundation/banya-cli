@@ -12,9 +12,9 @@ import (
 // forwards inbound `llm.chat` requests to this backend.
 type LLMBackend interface {
 	// Chat runs a (non-streaming or streaming) chat completion. Tokens
-	// are delivered through onToken as they arrive. The returned string
-	// is the full concatenated content; finishReason is optional.
-	Chat(ctx context.Context, params protocol.LlmChatParams, onToken func(string) error) (content, finishReason string, err error)
+	// are delivered through onToken as they arrive. Returns the full
+	// content, finish reason, and any native tool calls the model emitted.
+	Chat(ctx context.Context, params protocol.LlmChatParams, onToken func(string) error) (content, finishReason string, toolCalls []protocol.LlmToolCall, err error)
 
 	// Close releases any underlying transport resources.
 	Close() error

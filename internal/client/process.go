@@ -240,7 +240,7 @@ func (c *ProcessClient) handleLlmChat(req protocol.SidecarLine) {
 		c.hostCalls.Delete(req.ID)
 	}()
 
-	content, finish, err := c.backend.Chat(ctx, params, func(token string) error {
+	content, finish, toolCalls, err := c.backend.Chat(ctx, params, func(token string) error {
 		c.events <- protocol.ServerEvent{
 			Type:      protocol.EventContentDelta,
 			SessionID: req.ID,
@@ -258,6 +258,7 @@ func (c *ProcessClient) handleLlmChat(req protocol.SidecarLine) {
 	c.writeResponse(req.ID, protocol.LlmChatResult{
 		Content:      content,
 		FinishReason: finish,
+		ToolCalls:    toolCalls,
 	}, nil)
 }
 

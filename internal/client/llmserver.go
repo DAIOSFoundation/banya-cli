@@ -45,18 +45,42 @@ type openaiMessage struct {
 }
 
 type openaiChatRequest struct {
-	Model       string          `json:"model"`
-	Messages    []openaiMessage `json:"messages"`
-	MaxTokens   int             `json:"max_tokens,omitempty"`
-	Temperature float64         `json:"temperature,omitempty"`
-	TopP        float64         `json:"top_p,omitempty"`
-	Stream      bool            `json:"stream"`
+	Model       string             `json:"model"`
+	Messages    []openaiMessage    `json:"messages"`
+	MaxTokens   int                `json:"max_tokens,omitempty"`
+	Temperature float64            `json:"temperature,omitempty"`
+	TopP        float64            `json:"top_p,omitempty"`
+	Stream      bool               `json:"stream"`
+	Tools       []openaiTool       `json:"tools,omitempty"`
+	ToolChoice  any                `json:"tool_choice,omitempty"`
+}
+
+type openaiTool struct {
+	Type     string                 `json:"type"`
+	Function openaiToolSpecFunction `json:"function"`
+}
+
+type openaiToolSpecFunction struct {
+	Name        string         `json:"name"`
+	Description string         `json:"description,omitempty"`
+	Parameters  map[string]any `json:"parameters,omitempty"`
+}
+
+type openaiStreamToolCall struct {
+	Index    int    `json:"index"`
+	ID       string `json:"id,omitempty"`
+	Type     string `json:"type,omitempty"`
+	Function struct {
+		Name      string `json:"name,omitempty"`
+		Arguments string `json:"arguments,omitempty"`
+	} `json:"function,omitempty"`
 }
 
 type openaiStreamChunk struct {
 	Choices []struct {
 		Delta struct {
-			Content string `json:"content"`
+			Content   string                 `json:"content"`
+			ToolCalls []openaiStreamToolCall `json:"tool_calls,omitempty"`
 		} `json:"delta"`
 		FinishReason *string `json:"finish_reason"`
 	} `json:"choices"`
@@ -84,8 +108,11 @@ func NewLLMServerClient(baseURL, apiKey, model string) *LLMServerClient {
 }
 
 // Chat implements LLMBackend. It runs a single chat completion against
-// llm-server, streaming tokens through onToken until the model finishes.
-func (c *LLMServerClient) Chat(ctx context.Context, params protocol.LlmChatParams, onToken func(string) error) (string, string, error) {
+// llm-server, streaming content tokens through onToken. When
+// params.Tools is non-empty the model's native tool_calls are
+// accumulated per-index across the stream and returned alongside the
+// content.
+func (c *LLMServerClient) Chat(ctx context.Context, params protocol.LlmChatParams, onToken func(string) error) (string, string, []protocol.LlmToolCall, error) {
 	messages := make([]openaiMessage, 0, len(params.Messages))
 	for _, m := range params.Messages {
 		messages = append(messages, openaiMessage{Role: string(m.Role), Content: m.Content})
@@ -96,22 +123,42 @@ func (c *LLMServerClient) Chat(ctx context.Context, params protocol.LlmChatParam
 		model = c.model
 	}
 
-	body, err := json.Marshal(openaiChatRequest{
+	reqBody := openaiChatRequest{
 		Model:       model,
 		Messages:    messages,
 		MaxTokens:   pickInt(params.MaxTokens, 2048),
 		Temperature: pickFloat(params.Temperature, 0.7),
 		TopP:        pickFloat(params.TopP, 0.95),
 		Stream:      true,
-	})
+	}
+	if len(params.Tools) > 0 {
+		reqBody.Tools = make([]openaiTool, 0, len(params.Tools))
+		for _, t := range params.Tools {
+			reqBody.Tools = append(reqBody.Tools, openaiTool{
+				Type: t.Type,
+				Function: openaiToolSpecFunction{
+					Name:        t.Function.Name,
+					Description: t.Function.Description,
+					Parameters:  t.Function.Parameters,
+				},
+			})
+		}
+		if params.ToolChoice != nil {
+			reqBody.ToolChoice = params.ToolChoice
+		} else {
+			reqBody.ToolChoice = "auto"
+		}
+	}
+
+	body, err := json.Marshal(reqBody)
 	if err != nil {
-		return "", "", fmt.Errorf("marshal request: %w", err)
+		return "", "", nil, fmt.Errorf("marshal request: %w", err)
 	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
 		c.baseURL+"/v1/chat/completions", bytes.NewReader(body))
 	if err != nil {
-		return "", "", fmt.Errorf("create request: %w", err)
+		return "", "", nil, fmt.Errorf("create request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "text/event-stream")
@@ -121,17 +168,19 @@ func (c *LLMServerClient) Chat(ctx context.Context, params protocol.LlmChatParam
 
 	resp, err := c.http.Do(req)
 	if err != nil {
-		return "", "", fmt.Errorf("send request: %w", err)
+		return "", "", nil, fmt.Errorf("send request: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
 		errBody, _ := io.ReadAll(resp.Body)
-		return "", "", fmt.Errorf("llm-server %d: %s", resp.StatusCode, string(errBody))
+		return "", "", nil, fmt.Errorf("llm-server %d: %s", resp.StatusCode, string(errBody))
 	}
 
 	var content strings.Builder
 	var finish string
+	toolAcc := map[int]*protocol.LlmToolCall{}
+
 	reader := bufio.NewReader(resp.Body)
 	for {
 		line, rerr := reader.ReadString('\n')
@@ -139,7 +188,7 @@ func (c *LLMServerClient) Chat(ctx context.Context, params protocol.LlmChatParam
 			if rerr == io.EOF {
 				break
 			}
-			return content.String(), finish, fmt.Errorf("read stream: %w", rerr)
+			return content.String(), finish, collectToolCalls(toolAcc), fmt.Errorf("read stream: %w", rerr)
 		}
 		line = strings.TrimSpace(line)
 		if line == "" || !strings.HasPrefix(line, "data: ") {
@@ -160,8 +209,24 @@ func (c *LLMServerClient) Chat(ctx context.Context, params protocol.LlmChatParam
 			content.WriteString(tok)
 			if onToken != nil {
 				if cbErr := onToken(tok); cbErr != nil {
-					return content.String(), finish, cbErr
+					return content.String(), finish, collectToolCalls(toolAcc), cbErr
 				}
+			}
+		}
+		for _, delta := range chunk.Choices[0].Delta.ToolCalls {
+			entry := toolAcc[delta.Index]
+			if entry == nil {
+				entry = &protocol.LlmToolCall{}
+				toolAcc[delta.Index] = entry
+			}
+			if delta.ID != "" {
+				entry.ID = delta.ID
+			}
+			if delta.Function.Name != "" {
+				entry.Name = delta.Function.Name
+			}
+			if delta.Function.Arguments != "" {
+				entry.Arguments += delta.Function.Arguments
 			}
 		}
 		if fr := chunk.Choices[0].FinishReason; fr != nil {
@@ -169,7 +234,28 @@ func (c *LLMServerClient) Chat(ctx context.Context, params protocol.LlmChatParam
 			break
 		}
 	}
-	return content.String(), finish, nil
+	return content.String(), finish, collectToolCalls(toolAcc), nil
+}
+
+// collectToolCalls emits the accumulated tool_call map in stable index
+// order, dropping entries that never received a name (partial deltas).
+func collectToolCalls(acc map[int]*protocol.LlmToolCall) []protocol.LlmToolCall {
+	if len(acc) == 0 {
+		return nil
+	}
+	maxIdx := -1
+	for idx := range acc {
+		if idx > maxIdx {
+			maxIdx = idx
+		}
+	}
+	out := make([]protocol.LlmToolCall, 0, len(acc))
+	for i := 0; i <= maxIdx; i++ {
+		if tc, ok := acc[i]; ok && tc.Name != "" {
+			out = append(out, *tc)
+		}
+	}
+	return out
 }
 
 // HealthCheck pings llm-server with a minimal probe.
