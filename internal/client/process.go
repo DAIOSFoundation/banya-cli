@@ -187,11 +187,11 @@ func (c *ProcessClient) readLoop(stdout io.ReadCloser) {
 				}
 			}
 		case raw.Type != "":
-			c.events <- protocol.ServerEvent{
+			_ = c.safeEmitEvent(protocol.ServerEvent{
 				Type:      raw.Type,
 				SessionID: raw.SessionID,
 				Data:      raw.Data,
-			}
+			})
 		}
 	}
 }
@@ -241,10 +241,12 @@ func (c *ProcessClient) handleLlmChat(req protocol.SidecarLine) {
 	}()
 
 	content, finish, toolCalls, err := c.backend.Chat(ctx, params, func(token string) error {
-		c.events <- protocol.ServerEvent{
+		if err := c.safeEmitEvent(protocol.ServerEvent{
 			Type:      protocol.EventContentDelta,
 			SessionID: req.ID,
 			Data:      protocol.ContentDelta{Content: token},
+		}); err != nil {
+			return err
 		}
 		return nil
 	})
@@ -273,6 +275,23 @@ func (c *ProcessClient) handleLlmCancel(req protocol.SidecarLine) {
 		cancelled = true
 	}
 	c.writeResponse(req.ID, map[string]bool{"cancelled": cancelled}, nil)
+}
+
+// safeEmitEvent sends an event on c.events but recovers if the channel
+// is already closed (Close() raced with an in-flight host llm.chat
+// callback). Returns io.ErrClosedPipe-style sentinel so the backend
+// can abort its stream cleanly.
+func (c *ProcessClient) safeEmitEvent(evt protocol.ServerEvent) (err error) {
+	if c.closed.Load() {
+		return io.ErrClosedPipe
+	}
+	defer func() {
+		if r := recover(); r != nil {
+			err = io.ErrClosedPipe
+		}
+	}()
+	c.events <- evt
+	return nil
 }
 
 // writeResponse writes an RpcResponse to the sidecar's stdin.
