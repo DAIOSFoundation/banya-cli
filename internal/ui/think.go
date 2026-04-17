@@ -2,9 +2,16 @@ package ui
 
 import "strings"
 
-// thinkPlaceholder is what we show in place of a <think>…</think> block.
-// Kept short so it doesn't dominate the reply area.
+// thinkPlaceholder is the static fallback used when no animation frame
+// is supplied (tests, final message storage).
 const thinkPlaceholder = "_(thinking…)_"
+
+// thinkingAnimationFrame returns a "thinking", "thinking.", "thinking..",
+// "thinking..." style marker for the given frame counter.
+func thinkingAnimationFrame(frame int) string {
+	dots := strings.Repeat(".", frame%4)
+	return "_thinking" + dots + "_"
+}
 
 // Known implicit "start-of-reasoning" markers. Some models (notably the
 // Gemini family) emit their chain-of-thought without an opening <think>
@@ -34,6 +41,12 @@ var implicitThinkIntros = []string{
 // tail of a delta) are tolerated: we trim a trailing prefix that could
 // still grow into a tag to avoid flashing the opening angle bracket.
 func collapseThink(raw string) string {
+	return collapseThinkWithPlaceholder(raw, thinkPlaceholder)
+}
+
+// collapseThinkWithPlaceholder is collapseThink with a caller-supplied
+// placeholder (e.g. an animated "thinking..." frame).
+func collapseThinkWithPlaceholder(raw string, placeholder string) string {
 	if raw == "" {
 		return raw
 	}
@@ -62,7 +75,7 @@ func collapseThink(raw string) string {
 			break
 		}
 		out.WriteString(raw[:i])
-		out.WriteString(thinkPlaceholder)
+		out.WriteString(placeholder)
 		raw = raw[i+len("<think>"):]
 
 		j := strings.Index(raw, "</think>")

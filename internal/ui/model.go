@@ -69,6 +69,14 @@ type Model struct {
 
 	// Error display
 	lastError string
+
+	// Debug panel (Ctrl+T toggle)
+	debugOpen   bool
+	debugBuf    *debugBuffer
+	debugHeight int
+
+	// Thinking animation frame counter (cycles while streaming)
+	thinkingFrame int
 }
 
 // New creates a new TUI model.
@@ -96,6 +104,8 @@ func New(apiClient client.Client, cfg *config.Config) Model {
 		theme:      theme,
 		showBanner:   true,
 		taglineChars: -1,
+		debugBuf:     newDebugBuffer(),
+		debugHeight:  defaultDebugPanelHeight,
 	}
 }
 
@@ -162,6 +172,40 @@ func (m *Model) addUserMessage(content string) {
 		Content:   content,
 		CreatedAt: time.Now(),
 	})
+}
+
+// applyLayout (re)computes the viewport size based on current width/height
+// and whether the debug panel is open. Called on WindowSize and whenever
+// the debug panel is toggled.
+func (m *Model) applyLayout() {
+	if m.width == 0 || m.height == 0 {
+		return
+	}
+
+	m.statusBar.SetWidth(m.width)
+	m.chatView.SetWidth(m.width)
+	m.input.SetWidth(m.width)
+
+	headerHeight := 1
+	inputHeight := 5
+	reserved := headerHeight + inputHeight + 2
+	if m.debugOpen {
+		reserved += m.debugHeight
+	}
+	contentHeight := m.height - reserved
+	if contentHeight < 1 {
+		contentHeight = 1
+	}
+
+	if !m.ready {
+		m.viewport = viewport.New(m.width, contentHeight)
+		m.viewport.SetYOffset(0)
+		m.ready = true
+	} else {
+		m.viewport.Width = m.width
+		m.viewport.Height = contentHeight
+	}
+	m.updateViewportContent()
 }
 
 // addSystemMessage appends a system-role note (used for slash-command output).

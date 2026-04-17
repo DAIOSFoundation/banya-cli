@@ -37,6 +37,11 @@ func (m Model) View() string {
 		sections = append(sections, m.viewport.View())
 	}
 
+	// Debug panel (Ctrl+T)
+	if m.debugOpen {
+		sections = append(sections, renderDebugPanel(m.debugBuf, m.width, m.debugHeight))
+	}
+
 	// Error display
 	if m.lastError != "" {
 		errMsg := m.theme.Error.Render(fmt.Sprintf(" Error: %s", m.lastError))
@@ -97,11 +102,11 @@ func renderHelpBar(state State, width int) string {
 	var keys []string
 	switch state {
 	case StateReady:
-		keys = []string{"Enter:전송", "/clear:초기화", "/quit:종료", "Ctrl+C:종료"}
+		keys = []string{"Enter:전송", "Ctrl+T:디버그", "/clear:초기화", "/quit:종료", "Ctrl+C:종료"}
 	case StateStreaming:
-		keys = []string{"Ctrl+C:종료"}
+		keys = []string{"Ctrl+T:디버그", "Ctrl+C:종료"}
 	case StateApproval:
-		keys = []string{"Enter:승인", "Esc:거부", "Ctrl+C:종료"}
+		keys = []string{"Enter:승인", "Esc:거부", "Ctrl+T:디버그", "Ctrl+C:종료"}
 	}
 
 	seg := lipgloss.NewStyle().

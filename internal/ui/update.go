@@ -2,7 +2,6 @@ package ui
 
 import (
 	"github.com/charmbracelet/bubbles/spinner"
-	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/cascadecodes/banya-cli/internal/client"
 	"github.com/cascadecodes/banya-cli/internal/ui/commands"
@@ -55,19 +54,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.chatView.SetWidth(msg.Width)
 		m.input.SetWidth(msg.Width)
 
-		headerHeight := 1
-		inputHeight := 5
-		contentHeight := m.height - headerHeight - inputHeight - 2
-
-		if !m.ready {
-			m.viewport = viewport.New(msg.Width, contentHeight)
-			m.viewport.SetYOffset(0)
-			m.ready = true
-		} else {
-			m.viewport.Width = msg.Width
-			m.viewport.Height = contentHeight
-		}
-		m.updateViewportContent()
+		m.applyLayout()
 
 	case tea.KeyMsg:
 		return m.handleKeyPress(msg)
@@ -132,6 +119,13 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.state == StateStreaming {
 			m.updateViewportContent()
 		}
+
+	case thinkTickMsg:
+		m.thinkingFrame++
+		if m.state == StateStreaming {
+			cmds = append(cmds, thinkTick())
+		}
+		m.updateViewportContent()
 	}
 
 	// Update sub-components
@@ -154,6 +148,11 @@ func (m Model) handleKeyPress(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "ctrl+c", "ctrl+d":
 		return m, tea.Quit
 
+	case "ctrl+t":
+		m.debugOpen = !m.debugOpen
+		m.applyLayout()
+		return m, nil
+
 	case "enter":
 		if m.state == StateReady {
 			content := m.input.Value()
@@ -172,8 +171,10 @@ func (m Model) handleKeyPress(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.streamContent = ""
 			m.toolCalls = nil
 			m.lastError = ""
+			m.thinkingFrame = 0
+			m.debugBuf.push("USER", content)
 			m.updateViewportContent()
-			return m, m.sendMessage(content)
+			return m, tea.Batch(m.sendMessage(content), thinkTick())
 		}
 		if m.state == StateApproval && m.pendingApproval != nil {
 			toolCallID := m.pendingApproval.ToolCallID
@@ -211,6 +212,7 @@ func (m Model) handleServerEvent(evt protocol.ServerEvent) (tea.Model, tea.Cmd) 
 	case protocol.EventContentDelta:
 		if delta, ok := parsed.(protocol.ContentDelta); ok {
 			m.streamContent += delta.Content
+			m.debugBuf.push("TOK", delta.Content)
 			m.updateViewportContent()
 		}
 
@@ -244,9 +246,11 @@ func (m Model) handleServerEvent(evt protocol.ServerEvent) (tea.Model, tea.Cmd) 
 	case protocol.EventError:
 		if errData, ok := parsed.(protocol.ErrorData); ok {
 			m.lastError = errData.Message
+			m.debugBuf.push("ERR", errData.Code+": "+errData.Message)
 		}
 
 	case protocol.EventDone:
+		m.debugBuf.push("EVT", "done")
 		m.finalizeAssistantMessage()
 		m.state = StateReady
 		m.eventChan = nil
@@ -296,7 +300,9 @@ func (m *Model) updateViewportContent() {
 	content := m.chatView.RenderMessages(m.messages)
 
 	if m.streamContent != "" {
-		content += m.chatView.RenderStreamingContent(collapseThink(m.streamContent))
+		content += m.chatView.RenderStreamingContent(
+			collapseThinkWithPlaceholder(m.streamContent, thinkingAnimationFrame(m.thinkingFrame)),
+		)
 	}
 
 	if len(m.toolCalls) > 0 {
