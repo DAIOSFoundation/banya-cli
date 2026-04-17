@@ -10,7 +10,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"runtime"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -20,8 +19,11 @@ import (
 
 // ProcessClient communicates with a banya-core sidecar binary via stdio NDJSON
 // JSON-RPC. One sidecar process is kept alive for the lifetime of this client.
+// The transport is bidirectional: the sidecar may issue RpcRequests back to
+// the host (e.g. `llm.chat`) which are dispatched to the registered LLMBackend.
 type ProcessClient struct {
 	binPath string
+	backend LLMBackend
 
 	mu     sync.Mutex
 	cmd    *exec.Cmd
@@ -29,6 +31,7 @@ type ProcessClient struct {
 	reader *bufio.Scanner
 
 	pending    sync.Map // id → chan protocol.RpcResponse
+	hostCalls  sync.Map // id → context.CancelFunc (in-flight host RPCs)
 	events     chan protocol.ServerEvent
 	eventsOnce sync.Once
 	reqCounter atomic.Uint64
@@ -36,6 +39,10 @@ type ProcessClient struct {
 
 	cancel context.CancelFunc
 }
+
+// SetLLMBackend registers a backend to fulfill sidecar-initiated `llm.chat`
+// calls. Must be set before the sidecar starts issuing inbound requests.
+func (c *ProcessClient) SetLLMBackend(b LLMBackend) { c.backend = b }
 
 // NewProcessClient creates a sidecar-backed Client. binPath may be empty;
 // ResolveSidecarPath is used to find the executable.
@@ -50,9 +57,10 @@ func NewProcessClient(binPath string) (*ProcessClient, error) {
 // ResolveSidecarPath locates the banya-core sidecar binary using, in order:
 //  1. explicit argument
 //  2. BANYA_CORE_BIN env var
-//  3. $XDG_DATA_HOME/banya/bin/banya-core-<os>-<arch> (or ~/.local/share/...)
+//  3. $XDG_DATA_HOME/banya/bin/banya-core-<os>-<arch>
 //  4. banya-core-<os>-<arch> on PATH
 //  5. banya-core on PATH
+//  6. embedded sidecar → auto-extracted to $XDG_DATA_HOME/banya/bin
 func ResolveSidecarPath(explicit string) (string, error) {
 	if explicit != "" {
 		if _, err := os.Stat(explicit); err == nil {
@@ -67,10 +75,7 @@ func ResolveSidecarPath(explicit string) (string, error) {
 		return "", fmt.Errorf("BANYA_CORE_BIN=%s does not exist", env)
 	}
 
-	binName := fmt.Sprintf("banya-core-%s-%s", runtime.GOOS, runtime.GOARCH)
-	if runtime.GOOS == "windows" {
-		binName += ".exe"
-	}
+	binName := platformBinaryName()
 
 	// XDG data dir
 	dataDir := os.Getenv("XDG_DATA_HOME")
@@ -93,7 +98,13 @@ func ResolveSidecarPath(explicit string) (string, error) {
 	if p, err := exec.LookPath("banya-core"); err == nil {
 		return p, nil
 	}
-	return "", fmt.Errorf("banya-core sidecar not found (set BANYA_CORE_BIN or pass --sidecar)")
+
+	// Embedded bundle (extract once to XDG data dir).
+	if p, err := InstallEmbeddedSidecar(); err == nil {
+		return p, nil
+	}
+
+	return "", fmt.Errorf("banya-core sidecar not found (set BANYA_CORE_BIN or pass --sidecar, or ship a cli built with an embedded sidecar)")
 }
 
 // start lazily spawns the sidecar process and launches the reader goroutine.
@@ -137,7 +148,11 @@ func (c *ProcessClient) start() error {
 	return nil
 }
 
-// readLoop demultiplexes sidecar stdout into RPC responses and stream events.
+// readLoop demultiplexes sidecar stdout into:
+//
+//   - inbound RpcRequest  (sidecar → host)         — has `method`
+//   - RpcResponse         (sidecar reply to host)  — has `id` without `method`
+//   - ServerEvent         (streaming from sidecar) — has `type`
 func (c *ProcessClient) readLoop(stdout io.ReadCloser) {
 	defer func() {
 		_ = stdout.Close()
@@ -156,27 +171,125 @@ func (c *ProcessClient) readLoop(stdout io.ReadCloser) {
 			continue
 		}
 
-		// Response has `id`; event has `type`. Both fields are optional,
-		// but a response always carries `id` and an event always carries `type`.
-		if raw.ID != "" && raw.Type == "" {
-			ch, ok := c.pending.LoadAndDelete(raw.ID)
-			if !ok {
-				continue
+		switch {
+		case raw.Method != "":
+			go c.handleHostRequest(raw)
+		case raw.ID != "":
+			if ch, ok := c.pending.LoadAndDelete(raw.ID); ok {
+				var result any
+				if len(raw.Result) > 0 {
+					_ = json.Unmarshal(raw.Result, &result)
+				}
+				ch.(chan protocol.RpcResponse) <- protocol.RpcResponse{
+					ID:     raw.ID,
+					Result: result,
+					Error:  raw.Error,
+				}
 			}
-			ch.(chan protocol.RpcResponse) <- protocol.RpcResponse{
-				ID:     raw.ID,
-				Result: raw.Result,
-				Error:  raw.Error,
-			}
-			continue
-		}
-		if raw.Type != "" {
+		case raw.Type != "":
 			c.events <- protocol.ServerEvent{
 				Type:      raw.Type,
 				SessionID: raw.SessionID,
 				Data:      raw.Data,
 			}
 		}
+	}
+}
+
+// handleHostRequest fulfills an RpcRequest sent by the sidecar back to
+// the host (e.g. `llm.chat`). The result is written back on stdin as a
+// standard RpcResponse carrying the same id.
+func (c *ProcessClient) handleHostRequest(req protocol.SidecarLine) {
+	switch req.Method {
+	case protocol.MethodLlmChat:
+		c.handleLlmChat(req)
+	case protocol.MethodLlmCancel:
+		c.handleLlmCancel(req)
+	default:
+		c.writeResponse(req.ID, nil, &protocol.ErrorData{
+			Code:    "method_not_implemented",
+			Message: "host method not implemented: " + req.Method,
+		})
+	}
+}
+
+func (c *ProcessClient) handleLlmChat(req protocol.SidecarLine) {
+	if c.backend == nil {
+		c.writeResponse(req.ID, nil, &protocol.ErrorData{
+			Code:    "no_llm_backend",
+			Message: "no LLMBackend registered on host",
+		})
+		return
+	}
+
+	var params protocol.LlmChatParams
+	if len(req.Params) > 0 {
+		if err := json.Unmarshal(req.Params, &params); err != nil {
+			c.writeResponse(req.ID, nil, &protocol.ErrorData{
+				Code:    "bad_params",
+				Message: err.Error(),
+			})
+			return
+		}
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	c.hostCalls.Store(req.ID, cancel)
+	defer func() {
+		cancel()
+		c.hostCalls.Delete(req.ID)
+	}()
+
+	content, finish, err := c.backend.Chat(ctx, params, func(token string) error {
+		c.events <- protocol.ServerEvent{
+			Type:      protocol.EventContentDelta,
+			SessionID: req.ID,
+			Data:      protocol.ContentDelta{Content: token},
+		}
+		return nil
+	})
+	if err != nil {
+		c.writeResponse(req.ID, nil, &protocol.ErrorData{
+			Code:    "llm_backend_error",
+			Message: err.Error(),
+		})
+		return
+	}
+	c.writeResponse(req.ID, protocol.LlmChatResult{
+		Content:      content,
+		FinishReason: finish,
+	}, nil)
+}
+
+func (c *ProcessClient) handleLlmCancel(req protocol.SidecarLine) {
+	var p protocol.LlmCancelParams
+	if len(req.Params) > 0 {
+		_ = json.Unmarshal(req.Params, &p)
+	}
+	cancelled := false
+	if v, ok := c.hostCalls.Load(p.RequestID); ok {
+		v.(context.CancelFunc)()
+		cancelled = true
+	}
+	c.writeResponse(req.ID, map[string]bool{"cancelled": cancelled}, nil)
+}
+
+// writeResponse writes an RpcResponse to the sidecar's stdin.
+func (c *ProcessClient) writeResponse(id string, result any, errData *protocol.ErrorData) {
+	resp := protocol.RpcResponse{ID: id, Result: result, Error: errData}
+	body, err := json.Marshal(resp)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "[banya-cli] marshal host response: %v\n", err)
+		return
+	}
+	body = append(body, '\n')
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.stdin == nil {
+		return
+	}
+	if _, err := c.stdin.Write(body); err != nil {
+		fmt.Fprintf(os.Stderr, "[banya-cli] write host response: %v\n", err)
 	}
 }
 
@@ -276,6 +389,19 @@ func (c *ProcessClient) Close() error {
 
 // BinPath returns the resolved sidecar binary path (for diagnostics).
 func (c *ProcessClient) BinPath() string { return c.binPath }
+
+// Events returns the receive-only event channel. Useful for adapters
+// (e.g. server.Server) that want to consume events independently of
+// SendMessage. The channel is created on first sidecar start; callers
+// should invoke Start() (or any RPC call) first.
+func (c *ProcessClient) Events() <-chan protocol.ServerEvent {
+	if err := c.start(); err != nil {
+		closed := make(chan protocol.ServerEvent)
+		close(closed)
+		return closed
+	}
+	return c.events
+}
 
 // Compile-time assertion.
 var _ Client = (*ProcessClient)(nil)

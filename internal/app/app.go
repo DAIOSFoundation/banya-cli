@@ -64,17 +64,25 @@ func Run(cfg *config.Config) error {
 	return nil
 }
 
-// buildClient selects ProcessClient (default, spawns core sidecar) or
-// HTTPClient when cfg.Sidecar.Remote is true.
+// buildClient picks the Client implementation based on cfg.Mode.
+//
+//   - "remote"  → HTTPClient against cfg.Server.URL (a remote banya-core)
+//   - "sidecar" → spawn local banya-core and host the LLM backend for it
 func buildClient(cfg *config.Config, apiKey string) (client.Client, error) {
-	if cfg.Sidecar.Remote {
+	switch cfg.Mode {
+	case "remote":
 		return client.NewHTTPClient(cfg.Server.URL, apiKey), nil
+	case "", "sidecar":
+		backend := client.NewLLMServerClient(cfg.LLMServer.URL, cfg.LLMServer.APIKey, cfg.LLMServer.Model)
+		pc, err := client.NewProcessClient(cfg.Sidecar.Path)
+		if err != nil {
+			return nil, err
+		}
+		pc.SetLLMBackend(backend)
+		return pc, nil
+	default:
+		return nil, fmt.Errorf("unknown mode %q (want sidecar|remote)", cfg.Mode)
 	}
-	pc, err := client.NewProcessClient(cfg.Sidecar.Path)
-	if err != nil {
-		return nil, err
-	}
-	return pc, nil
 }
 
 // ensureNerdFont checks for a Nerd Font and offers to install one if missing.

@@ -16,19 +16,27 @@ import (
 
 // Config holds the complete application configuration.
 type Config struct {
-	Sidecar SidecarConfig `mapstructure:"sidecar"`
-	Server  ServerConfig  `mapstructure:"server"`
-	UI      UIConfig      `mapstructure:"ui"`
-	Shell   ShellConfig   `mapstructure:"shell"`
-	Log     LogConfig     `mapstructure:"log"`
+	Mode      string          `mapstructure:"mode"` // "sidecar" (default), "remote", "llm-server"
+	Sidecar   SidecarConfig   `mapstructure:"sidecar"`
+	Server    ServerConfig    `mapstructure:"server"`
+	LLMServer LLMServerConfig `mapstructure:"llm_server"`
+	UI        UIConfig        `mapstructure:"ui"`
+	Shell     ShellConfig     `mapstructure:"shell"`
+	Log       LogConfig       `mapstructure:"log"`
 }
 
 // SidecarConfig controls how the CLI locates and runs the banya-core sidecar binary.
 type SidecarConfig struct {
 	// Path is an explicit path to the sidecar binary. Empty → auto-resolve.
 	Path string `mapstructure:"path"`
-	// Remote forces HTTP mode against Server.URL instead of spawning a sidecar.
-	Remote bool `mapstructure:"remote"`
+}
+
+// LLMServerConfig targets an OpenAI-compatible llm-server (LLM Lab).
+// Used when Mode == "llm-server".
+type LLMServerConfig struct {
+	URL    string `mapstructure:"url"`
+	APIKey string `mapstructure:"api_key"`
+	Model  string `mapstructure:"model"`
 }
 
 // ServerConfig holds settings for connecting to the code agent API.
@@ -82,10 +90,13 @@ func Load() (*Config, error) {
 	v := viper.New()
 
 	// Defaults
+	v.SetDefault("mode", "sidecar")
 	v.SetDefault("sidecar.path", "")
-	v.SetDefault("sidecar.remote", false)
 	v.SetDefault("server.url", "http://localhost:8080")
 	v.SetDefault("server.api_key", "")
+	v.SetDefault("llm_server.url", "http://118.37.145.31:8083")
+	v.SetDefault("llm_server.api_key", "")
+	v.SetDefault("llm_server.model", "/models/model")
 	v.SetDefault("ui.theme", "dark")
 	v.SetDefault("ui.show_tokens", true)
 	v.SetDefault("ui.word_wrap", true)

@@ -21,10 +21,13 @@ func main() {
 	}
 
 	// Global flags
-	rootCmd.PersistentFlags().String("sidecar", "", "Path to banya-core sidecar binary (default: auto-resolve via BANYA_CORE_BIN / XDG / PATH)")
-	rootCmd.PersistentFlags().Bool("remote", false, "Use HTTP client against --server instead of spawning a local sidecar")
-	rootCmd.PersistentFlags().StringP("server", "s", "", "Server URL (used with --remote; default: http://localhost:8080)")
-	rootCmd.PersistentFlags().StringP("api-key", "k", "", "API key for authentication (remote mode only)")
+	rootCmd.PersistentFlags().String("mode", "", "Client mode: sidecar (default) | remote")
+	rootCmd.PersistentFlags().String("sidecar", "", "Path to banya-core sidecar binary (sidecar mode only)")
+	rootCmd.PersistentFlags().String("llm-url", "", "llm-server base URL (llm-server/sidecar modes)")
+	rootCmd.PersistentFlags().String("llm-key", "", "llm-server API key (llm-server/sidecar modes)")
+	rootCmd.PersistentFlags().String("llm-model", "", "llm-server model id (llm-server/sidecar modes)")
+	rootCmd.PersistentFlags().StringP("server", "s", "", "Remote banya-core URL (remote mode only)")
+	rootCmd.PersistentFlags().StringP("api-key", "k", "", "API key for remote banya-core")
 	rootCmd.PersistentFlags().String("theme", "", "UI theme: dark, light")
 
 	// Subcommands
@@ -34,6 +37,7 @@ func main() {
 	rootCmd.AddCommand(configCmd())
 	rootCmd.AddCommand(historyCmd())
 	rootCmd.AddCommand(setupCmd())
+	rootCmd.AddCommand(serveCmd())
 
 	if err := rootCmd.Execute(); err != nil {
 		os.Exit(1)
@@ -48,11 +52,20 @@ func runChat(cmd *cobra.Command, args []string) error {
 	}
 
 	// Apply CLI flag overrides
+	if m, _ := cmd.Flags().GetString("mode"); m != "" {
+		cfg.Mode = m
+	}
 	if sc, _ := cmd.Flags().GetString("sidecar"); sc != "" {
 		cfg.Sidecar.Path = sc
 	}
-	if r, _ := cmd.Flags().GetBool("remote"); r {
-		cfg.Sidecar.Remote = true
+	if u, _ := cmd.Flags().GetString("llm-url"); u != "" {
+		cfg.LLMServer.URL = u
+	}
+	if k, _ := cmd.Flags().GetString("llm-key"); k != "" {
+		cfg.LLMServer.APIKey = k
+	}
+	if m, _ := cmd.Flags().GetString("llm-model"); m != "" {
+		cfg.LLMServer.Model = m
 	}
 	if s, _ := cmd.Flags().GetString("server"); s != "" {
 		cfg.Server.URL = s
@@ -133,13 +146,15 @@ func configCmd() *cobra.Command {
 				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 				return
 			}
-			fmt.Printf("Config file:  %s\n", config.ConfigFilePath())
-			fmt.Printf("Sidecar path: %s\n", cfg.Sidecar.Path)
-			fmt.Printf("Remote mode:  %t\n", cfg.Sidecar.Remote)
-			fmt.Printf("Server URL:   %s\n", cfg.Server.URL)
-			fmt.Printf("Theme:        %s\n", cfg.UI.Theme)
-			fmt.Printf("Shell:        %s\n", cfg.Shell.Shell)
-			fmt.Printf("Log level:    %s\n", cfg.Log.Level)
+			fmt.Printf("Config file:    %s\n", config.ConfigFilePath())
+			fmt.Printf("Mode:           %s\n", cfg.Mode)
+			fmt.Printf("Sidecar path:   %s\n", cfg.Sidecar.Path)
+			fmt.Printf("LLM server URL: %s\n", cfg.LLMServer.URL)
+			fmt.Printf("LLM model:      %s\n", cfg.LLMServer.Model)
+			fmt.Printf("Remote URL:     %s\n", cfg.Server.URL)
+			fmt.Printf("Theme:          %s\n", cfg.UI.Theme)
+			fmt.Printf("Shell:          %s\n", cfg.Shell.Shell)
+			fmt.Printf("Log level:      %s\n", cfg.Log.Level)
 		},
 	}
 	return cmd

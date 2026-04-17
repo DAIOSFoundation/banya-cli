@@ -1,16 +1,37 @@
 APP_NAME := banya
 VERSION := 0.1.0
 BUILD_DIR := build
-GO := $(HOME)/go-install/go/bin/go
+GO ?= go
 GOFLAGS := -trimpath
 LDFLAGS := -s -w -X main.version=$(VERSION)
 
-.PHONY: all build build-mock install clean test lint run dev help
+# Path to the prebuilt banya-core sidecar binaries. The cli embeds the
+# binary matching the host platform (or a target platform during release).
+SIDECAR_DIR ?= ../banya-core/dist
+EMBED_DIR := internal/client/embedded_sidecar
+
+# Resolve host platform sidecar name.
+HOST_OS := $(shell uname -s | tr '[:upper:]' '[:lower:]')
+HOST_ARCH := $(shell uname -m | sed 's/x86_64/amd64/')
+HOST_SIDECAR := banya-core-$(HOST_OS)-$(HOST_ARCH)
+
+.PHONY: all build build-mock install clean test lint run dev help embed-sidecar
 
 all: build
 
-## build: Build the CLI binary
-build:
+## embed-sidecar: Copy the host-platform banya-core binary into the embed dir
+embed-sidecar:
+	@mkdir -p $(EMBED_DIR)
+	@if [ -f "$(SIDECAR_DIR)/$(HOST_SIDECAR)" ]; then \
+		cp "$(SIDECAR_DIR)/$(HOST_SIDECAR)" "$(EMBED_DIR)/$(HOST_SIDECAR)"; \
+		echo "embedded $(HOST_SIDECAR) (`du -h $(EMBED_DIR)/$(HOST_SIDECAR) | cut -f1`)"; \
+	else \
+		echo "WARN: $(SIDECAR_DIR)/$(HOST_SIDECAR) not found — build banya-core first (pnpm build:sidecar)"; \
+		echo "WARN: cli will be built without an embedded sidecar"; \
+	fi
+
+## build: Build the CLI binary (with embedded sidecar)
+build: embed-sidecar
 	@mkdir -p $(BUILD_DIR)
 	$(GO) build $(GOFLAGS) -ldflags "$(LDFLAGS)" -o $(BUILD_DIR)/$(APP_NAME) ./cmd/banya
 
