@@ -18,13 +18,15 @@ import (
 // LLMServerClient is the host-side LLM backend used by ProcessClient to
 // fulfill `llm.chat` requests issued by the banya-core sidecar. It speaks
 // the OpenAI-compatible chat-completions protocol exposed by llm-server
-// (LLM Lab Client Manager :8083). It is NOT a top-level Client mode —
-// the cli always goes through banya-core (sidecar or remote).
+// (LLM Lab Client Manager :8083 / public proxy :5174). It is NOT a
+// top-level Client mode — the cli always goes through banya-core
+// (sidecar or remote).
 type LLMServerClient struct {
-	baseURL string
-	apiKey  string
-	model   string
-	http    *http.Client
+	baseURL    string
+	apiKey     string
+	model      string
+	targetPort string // X-Target-Port header, routes to a specific vLLM instance
+	http       *http.Client
 
 	mu      sync.Mutex
 	cancels map[string]context.CancelFunc
@@ -33,9 +35,10 @@ type LLMServerClient struct {
 // Defaults for the LLM Lab endpoint (5174 is the public proxy that
 // forwards to the Client Manager on :8083 behind the firewall).
 const (
-	DefaultLLMServerURL    = "http://118.37.145.31:5174"
-	DefaultLLMServerAPIKey = "sk-959b0eb4a8899f7e194f294eeebde0235956425ba77c56de"
-	DefaultLLMServerModel  = "/models/model"
+	DefaultLLMServerURL        = "http://118.37.145.31:5174"
+	DefaultLLMServerAPIKey     = "sk-959b0eb4a8899f7e194f294eeebde0235956425ba77c56de"
+	DefaultLLMServerModel      = "/models/model"
+	DefaultLLMServerTargetPort = "8085" // Qwen3.5-122B-A10B vLLM instance
 )
 
 // openaiMessage is the OpenAI chat-completions message format.
@@ -89,6 +92,12 @@ type openaiStreamChunk struct {
 // NewLLMServerClient returns a new llm-server backend.
 // Empty arguments fall back to package defaults.
 func NewLLMServerClient(baseURL, apiKey, model string) *LLMServerClient {
+	return NewLLMServerClientWithTarget(baseURL, apiKey, model, "")
+}
+
+// NewLLMServerClientWithTarget is NewLLMServerClient with an explicit
+// X-Target-Port header. Empty targetPort uses the package default.
+func NewLLMServerClientWithTarget(baseURL, apiKey, model, targetPort string) *LLMServerClient {
 	if baseURL == "" {
 		baseURL = DefaultLLMServerURL
 	}
@@ -98,12 +107,16 @@ func NewLLMServerClient(baseURL, apiKey, model string) *LLMServerClient {
 	if model == "" {
 		model = DefaultLLMServerModel
 	}
+	if targetPort == "" {
+		targetPort = DefaultLLMServerTargetPort
+	}
 	return &LLMServerClient{
-		baseURL: strings.TrimRight(baseURL, "/"),
-		apiKey:  apiKey,
-		model:   model,
-		http:    &http.Client{Timeout: 0},
-		cancels: make(map[string]context.CancelFunc),
+		baseURL:    strings.TrimRight(baseURL, "/"),
+		apiKey:     apiKey,
+		model:      model,
+		targetPort: targetPort,
+		http:       &http.Client{Timeout: 0},
+		cancels:    make(map[string]context.CancelFunc),
 	}
 }
 
@@ -143,10 +156,11 @@ func (c *LLMServerClient) Chat(ctx context.Context, params protocol.LlmChatParam
 				},
 			})
 		}
+		// Some llm-server backends (vLLM) require --enable-auto-tool-choice
+		// to accept tool_choice="auto". Defer to the server's default
+		// unless the caller was explicit.
 		if params.ToolChoice != nil {
 			reqBody.ToolChoice = params.ToolChoice
-		} else {
-			reqBody.ToolChoice = "auto"
 		}
 	}
 
@@ -164,6 +178,9 @@ func (c *LLMServerClient) Chat(ctx context.Context, params protocol.LlmChatParam
 	req.Header.Set("Accept", "text/event-stream")
 	if c.apiKey != "" {
 		req.Header.Set("Authorization", "Bearer "+c.apiKey)
+	}
+	if c.targetPort != "" {
+		req.Header.Set("X-Target-Port", c.targetPort)
 	}
 
 	resp, err := c.http.Do(req)
@@ -277,6 +294,9 @@ func (c *LLMServerClient) HealthCheck() error {
 	req.Header.Set("Content-Type", "application/json")
 	if c.apiKey != "" {
 		req.Header.Set("Authorization", "Bearer "+c.apiKey)
+	}
+	if c.targetPort != "" {
+		req.Header.Set("X-Target-Port", c.targetPort)
 	}
 	resp, err := c.http.Do(req)
 	if err != nil {

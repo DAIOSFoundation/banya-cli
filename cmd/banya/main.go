@@ -27,6 +27,7 @@ func main() {
 	rootCmd.PersistentFlags().String("llm-url", "", "llm-server base URL (llm-server/sidecar modes)")
 	rootCmd.PersistentFlags().String("llm-key", "", "llm-server API key (llm-server/sidecar modes)")
 	rootCmd.PersistentFlags().String("llm-model", "", "llm-server model id (llm-server/sidecar modes)")
+	rootCmd.PersistentFlags().String("llm-target-port", "", "X-Target-Port header (LLM Lab vLLM instance, default 8085)")
 	rootCmd.PersistentFlags().StringP("server", "s", "", "Remote banya-core URL (remote mode only)")
 	rootCmd.PersistentFlags().StringP("api-key", "k", "", "API key for remote banya-core")
 	rootCmd.PersistentFlags().String("theme", "", "UI theme: dark, light")
@@ -70,6 +71,9 @@ func runChat(cmd *cobra.Command, args []string) error {
 	}
 	if m, _ := cmd.Flags().GetString("llm-model"); m != "" {
 		cfg.LLMServer.Model = m
+	}
+	if tp, _ := cmd.Flags().GetString("llm-target-port"); tp != "" {
+		cfg.LLMServer.TargetPort = tp
 	}
 	if s, _ := cmd.Flags().GetString("server"); s != "" {
 		cfg.Server.URL = s

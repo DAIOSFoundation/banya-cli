@@ -56,8 +56,8 @@ func runServe(cmd *cobra.Command, _ []string) error {
 		return fmt.Errorf("init sidecar: %w", err)
 	}
 	defer pc.Close()
-	pc.SetLLMBackend(client.NewLLMServerClient(
-		cfg.LLMServer.URL, cfg.LLMServer.APIKey, cfg.LLMServer.Model,
+	pc.SetLLMBackend(client.NewLLMServerClientWithTarget(
+		cfg.LLMServer.URL, cfg.LLMServer.APIKey, cfg.LLMServer.Model, cfg.LLMServer.TargetPort,
 	))
 
 	if err := pc.HealthCheck(); err != nil {

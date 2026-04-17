@@ -78,7 +78,7 @@ func buildClient(cfg *config.Config, apiKey string) (client.Client, error) {
 	case "remote":
 		return client.NewHTTPClient(cfg.Server.URL, apiKey), nil
 	case "", "sidecar":
-		backend := client.NewLLMServerClient(cfg.LLMServer.URL, cfg.LLMServer.APIKey, cfg.LLMServer.Model)
+		backend := client.NewLLMServerClientWithTarget(cfg.LLMServer.URL, cfg.LLMServer.APIKey, cfg.LLMServer.Model, cfg.LLMServer.TargetPort)
 		pc, err := client.NewProcessClient(cfg.Sidecar.Path)
 		if err != nil {
 			return nil, err

@@ -33,11 +33,15 @@ type SidecarConfig struct {
 }
 
 // LLMServerConfig targets an OpenAI-compatible llm-server (LLM Lab).
-// Used when Mode == "llm-server".
+// The cli forwards every llm.chat host call through this backend.
 type LLMServerConfig struct {
 	URL    string `mapstructure:"url"`
 	APIKey string `mapstructure:"api_key"`
 	Model  string `mapstructure:"model"`
+	// TargetPort is the X-Target-Port header value used by the LLM
+	// Lab Client Manager to route to a specific vLLM/SGLang instance
+	// behind the proxy (e.g. "8085" → Qwen3.5-122B vLLM).
+	TargetPort string `mapstructure:"target_port"`
 }
 
 // ServerConfig holds settings for connecting to the code agent API.
@@ -99,6 +103,7 @@ func Load() (*Config, error) {
 	v.SetDefault("llm_server.url", "http://118.37.145.31:5174")
 	v.SetDefault("llm_server.api_key", "sk-959b0eb4a8899f7e194f294eeebde0235956425ba77c56de")
 	v.SetDefault("llm_server.model", "/models/model")
+	v.SetDefault("llm_server.target_port", "8085")
 	v.SetDefault("ui.theme", "dark")
 	v.SetDefault("ui.show_tokens", true)
 	v.SetDefault("ui.word_wrap", true)
