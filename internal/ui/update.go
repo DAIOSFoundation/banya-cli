@@ -5,8 +5,42 @@ import (
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/cascadecodes/banya-cli/internal/client"
+	"github.com/cascadecodes/banya-cli/internal/ui/commands"
 	"github.com/cascadecodes/banya-cli/pkg/protocol"
 )
+
+// runSlashCommand dispatches a /command line through the registry and
+// renders the result as a system message.
+func (m Model) runSlashCommand(line string) (tea.Model, tea.Cmd) {
+	ctx := commands.Context{
+		Client:    m.client,
+		Config:    m.cfg,
+		SessionID: m.sessionID,
+	}
+	res := m.commands.Dispatch(line, ctx)
+
+	m.input.Reset()
+	m.lastError = ""
+
+	if res.Clear {
+		m.messages = nil
+		m.streamContent = ""
+		m.toolCalls = nil
+		m.showBanner = false
+	}
+	if res.Output != "" {
+		m.addSystemMessage(res.Output)
+	}
+	m.updateViewportContent()
+
+	if res.Quit {
+		return m, tea.Quit
+	}
+	if res.Cmd != nil {
+		return m, res.Cmd
+	}
+	return m, nil
+}
 
 // Update handles all messages and key events.
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -126,17 +160,8 @@ func (m Model) handleKeyPress(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			if content == "" {
 				return m, nil
 			}
-			switch content {
-			case "/quit", "/exit":
-				return m, tea.Quit
-			case "/clear":
-				m.messages = nil
-				m.streamContent = ""
-				m.toolCalls = nil
-				m.input.Reset()
-				m.lastError = ""
-				m.updateViewportContent()
-				return m, nil
+			if commands.IsSlashCommand(content) {
+				return m.runSlashCommand(content)
 			}
 
 			m.showBanner = false

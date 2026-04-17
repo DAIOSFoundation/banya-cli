@@ -9,6 +9,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/cascadecodes/banya-cli/internal/client"
 	"github.com/cascadecodes/banya-cli/internal/config"
+	"github.com/cascadecodes/banya-cli/internal/ui/commands"
 	"github.com/cascadecodes/banya-cli/internal/ui/components"
 	"github.com/cascadecodes/banya-cli/internal/ui/styles"
 	"github.com/cascadecodes/banya-cli/pkg/protocol"
@@ -40,8 +41,9 @@ type Model struct {
 	pendingApproval *protocol.ApprovalRequest
 
 	// Dependencies
-	client client.Client
-	cfg    *config.Config
+	client   client.Client
+	cfg      *config.Config
+	commands *commands.Registry
 
 	// UI components
 	input      components.InputModel
@@ -84,6 +86,7 @@ func New(apiClient client.Client, cfg *config.Config) Model {
 		toolCalls:  make([]protocol.ToolCall, 0),
 		client:     apiClient,
 		cfg:        cfg,
+		commands:   commands.NewRegistry(),
 		input:      components.NewInputModel(theme),
 		statusBar:  components.NewStatusBar(theme),
 		chatView:   components.NewChatView(theme, 80),
@@ -156,6 +159,16 @@ func (m *Model) addUserMessage(content string) {
 	m.messages = append(m.messages, protocol.Message{
 		ID:        uuid.New().String(),
 		Role:      protocol.RoleUser,
+		Content:   content,
+		CreatedAt: time.Now(),
+	})
+}
+
+// addSystemMessage appends a system-role note (used for slash-command output).
+func (m *Model) addSystemMessage(content string) {
+	m.messages = append(m.messages, protocol.Message{
+		ID:        uuid.New().String(),
+		Role:      protocol.RoleSystem,
 		Content:   content,
 		CreatedAt: time.Now(),
 	})
