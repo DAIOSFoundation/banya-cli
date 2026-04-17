@@ -30,10 +30,12 @@ type LLMServerClient struct {
 	cancels map[string]context.CancelFunc
 }
 
-// Defaults for the LLM Lab endpoint.
+// Defaults for the LLM Lab endpoint (5174 is the public proxy that
+// forwards to the Client Manager on :8083 behind the firewall).
 const (
-	DefaultLLMServerURL   = "http://118.37.145.31:8083"
-	DefaultLLMServerModel = "/models/model"
+	DefaultLLMServerURL    = "http://118.37.145.31:5174"
+	DefaultLLMServerAPIKey = "sk-959b0eb4a8899f7e194f294eeebde0235956425ba77c56de"
+	DefaultLLMServerModel  = "/models/model"
 )
 
 // openaiMessage is the OpenAI chat-completions message format.
@@ -65,6 +67,9 @@ type openaiStreamChunk struct {
 func NewLLMServerClient(baseURL, apiKey, model string) *LLMServerClient {
 	if baseURL == "" {
 		baseURL = DefaultLLMServerURL
+	}
+	if apiKey == "" {
+		apiKey = DefaultLLMServerAPIKey
 	}
 	if model == "" {
 		model = DefaultLLMServerModel

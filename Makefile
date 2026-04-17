@@ -40,9 +40,23 @@ build-mock:
 	@mkdir -p $(BUILD_DIR)
 	$(GO) build $(GOFLAGS) -o $(BUILD_DIR)/mockserver ./cmd/mockserver
 
-## install: Install to $GOPATH/bin
-install:
-	$(GO) install $(GOFLAGS) -ldflags "$(LDFLAGS)" ./cmd/banya
+## install: Install the cli to ~/.local/bin and register a shell alias
+##          Pass PREFIX=/path to install elsewhere; pass NO_ALIAS=1 to skip rc edits
+install: build
+	@PREFIX="$${PREFIX:-$$HOME/.local/bin}"; \
+	mkdir -p "$$PREFIX"; \
+	cp "$(BUILD_DIR)/$(APP_NAME)" "$$PREFIX/$(APP_NAME)"; \
+	chmod +x "$$PREFIX/$(APP_NAME)"; \
+	echo "installed $$PREFIX/$(APP_NAME)"; \
+	if [ -z "$$NO_ALIAS" ]; then \
+		sh scripts/register-alias.sh "$$PREFIX/$(APP_NAME)"; \
+	fi
+
+## uninstall: Remove the installed binary and the shell alias block
+uninstall:
+	@PREFIX="$${PREFIX:-$$HOME/.local/bin}"; \
+	rm -f "$$PREFIX/$(APP_NAME)" && echo "removed $$PREFIX/$(APP_NAME)" || true; \
+	sh scripts/register-alias.sh --uninstall
 
 ## run: Build and run the CLI
 run: build
