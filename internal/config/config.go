@@ -16,10 +16,19 @@ import (
 
 // Config holds the complete application configuration.
 type Config struct {
-	Server ServerConfig `mapstructure:"server"`
-	UI     UIConfig     `mapstructure:"ui"`
-	Shell  ShellConfig  `mapstructure:"shell"`
-	Log    LogConfig    `mapstructure:"log"`
+	Sidecar SidecarConfig `mapstructure:"sidecar"`
+	Server  ServerConfig  `mapstructure:"server"`
+	UI      UIConfig      `mapstructure:"ui"`
+	Shell   ShellConfig   `mapstructure:"shell"`
+	Log     LogConfig     `mapstructure:"log"`
+}
+
+// SidecarConfig controls how the CLI locates and runs the banya-core sidecar binary.
+type SidecarConfig struct {
+	// Path is an explicit path to the sidecar binary. Empty → auto-resolve.
+	Path string `mapstructure:"path"`
+	// Remote forces HTTP mode against Server.URL instead of spawning a sidecar.
+	Remote bool `mapstructure:"remote"`
 }
 
 // ServerConfig holds settings for connecting to the code agent API.
@@ -73,6 +82,8 @@ func Load() (*Config, error) {
 	v := viper.New()
 
 	// Defaults
+	v.SetDefault("sidecar.path", "")
+	v.SetDefault("sidecar.remote", false)
 	v.SetDefault("server.url", "http://localhost:8080")
 	v.SetDefault("server.api_key", "")
 	v.SetDefault("ui.theme", "dark")

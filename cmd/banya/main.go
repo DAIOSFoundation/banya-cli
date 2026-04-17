@@ -21,8 +21,10 @@ func main() {
 	}
 
 	// Global flags
-	rootCmd.PersistentFlags().StringP("server", "s", "", "Server URL (default: http://localhost:8080)")
-	rootCmd.PersistentFlags().StringP("api-key", "k", "", "API key for authentication")
+	rootCmd.PersistentFlags().String("sidecar", "", "Path to banya-core sidecar binary (default: auto-resolve via BANYA_CORE_BIN / XDG / PATH)")
+	rootCmd.PersistentFlags().Bool("remote", false, "Use HTTP client against --server instead of spawning a local sidecar")
+	rootCmd.PersistentFlags().StringP("server", "s", "", "Server URL (used with --remote; default: http://localhost:8080)")
+	rootCmd.PersistentFlags().StringP("api-key", "k", "", "API key for authentication (remote mode only)")
 	rootCmd.PersistentFlags().String("theme", "", "UI theme: dark, light")
 
 	// Subcommands
@@ -46,6 +48,12 @@ func runChat(cmd *cobra.Command, args []string) error {
 	}
 
 	// Apply CLI flag overrides
+	if sc, _ := cmd.Flags().GetString("sidecar"); sc != "" {
+		cfg.Sidecar.Path = sc
+	}
+	if r, _ := cmd.Flags().GetBool("remote"); r {
+		cfg.Sidecar.Remote = true
+	}
 	if s, _ := cmd.Flags().GetString("server"); s != "" {
 		cfg.Server.URL = s
 	}
@@ -125,11 +133,13 @@ func configCmd() *cobra.Command {
 				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 				return
 			}
-			fmt.Printf("Config file: %s\n", config.ConfigFilePath())
-			fmt.Printf("Server URL:  %s\n", cfg.Server.URL)
-			fmt.Printf("Theme:       %s\n", cfg.UI.Theme)
-			fmt.Printf("Shell:       %s\n", cfg.Shell.Shell)
-			fmt.Printf("Log level:   %s\n", cfg.Log.Level)
+			fmt.Printf("Config file:  %s\n", config.ConfigFilePath())
+			fmt.Printf("Sidecar path: %s\n", cfg.Sidecar.Path)
+			fmt.Printf("Remote mode:  %t\n", cfg.Sidecar.Remote)
+			fmt.Printf("Server URL:   %s\n", cfg.Server.URL)
+			fmt.Printf("Theme:        %s\n", cfg.UI.Theme)
+			fmt.Printf("Shell:        %s\n", cfg.Shell.Shell)
+			fmt.Printf("Log level:    %s\n", cfg.Log.Level)
 		},
 	}
 	return cmd

@@ -45,7 +45,10 @@ func Run(cfg *config.Config) error {
 		}
 	}
 
-	apiClient := client.NewHTTPClient(cfg.Server.URL, apiKey)
+	apiClient, err := buildClient(cfg, apiKey)
+	if err != nil {
+		return fmt.Errorf("init client: %w", err)
+	}
 	defer apiClient.Close()
 
 	fmt.Fprint(os.Stdout, setBlackBg+setGreenFg)
@@ -59,6 +62,19 @@ func Run(cfg *config.Config) error {
 	}
 
 	return nil
+}
+
+// buildClient selects ProcessClient (default, spawns core sidecar) or
+// HTTPClient when cfg.Sidecar.Remote is true.
+func buildClient(cfg *config.Config, apiKey string) (client.Client, error) {
+	if cfg.Sidecar.Remote {
+		return client.NewHTTPClient(cfg.Server.URL, apiKey), nil
+	}
+	pc, err := client.NewProcessClient(cfg.Sidecar.Path)
+	if err != nil {
+		return nil, err
+	}
+	return pc, nil
 }
 
 // ensureNerdFont checks for a Nerd Font and offers to install one if missing.
