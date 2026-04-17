@@ -175,12 +175,14 @@ func (m *Model) addSystemMessage(content string) {
 }
 
 // finalizeAssistantMessage converts the streaming buffer into a message.
+// The stored content has <think>…</think> blocks collapsed, so re-rendering
+// history stays tidy.
 func (m *Model) finalizeAssistantMessage() {
 	if m.streamContent != "" {
 		m.messages = append(m.messages, protocol.Message{
 			ID:        uuid.New().String(),
 			Role:      protocol.RoleAssistant,
-			Content:   m.streamContent,
+			Content:   collapseThink(m.streamContent),
 			ToolCalls: m.toolCalls,
 			CreatedAt: time.Now(),
 		})

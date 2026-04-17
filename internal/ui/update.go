@@ -296,7 +296,7 @@ func (m *Model) updateViewportContent() {
 	content := m.chatView.RenderMessages(m.messages)
 
 	if m.streamContent != "" {
-		content += m.chatView.RenderStreamingContent(m.streamContent)
+		content += m.chatView.RenderStreamingContent(collapseThink(m.streamContent))
 	}
 
 	if len(m.toolCalls) > 0 {
