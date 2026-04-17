@@ -40,6 +40,7 @@ func main() {
 	rootCmd.AddCommand(historyCmd())
 	rootCmd.AddCommand(setupCmd())
 	rootCmd.AddCommand(serveCmd())
+	rootCmd.AddCommand(runCmd())
 
 	if err := rootCmd.Execute(); err != nil {
 		os.Exit(1)
