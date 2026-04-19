@@ -29,6 +29,11 @@ type Context struct {
 	// SetPromptMode changes the active prompt mode. Returns an error for
 	// invalid values; valid ones are code / ask / plan / agent.
 	SetPromptMode func(protocol.PromptType) error
+
+	// SetLanguage updates the in-memory + on-disk default language. Valid
+	// values are normalised codes (ko | en). Returns an error on invalid
+	// input or disk failure.
+	SetLanguage func(lang string) error
 }
 
 // Result describes what the UI should show after a command runs.

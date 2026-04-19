@@ -10,10 +10,13 @@ import (
 	"github.com/cascadecodes/banya-cli/internal/ui/styles"
 )
 
-// Powerline separator characters (require Nerd Font / Powerline-patched font)
+// Powerline-style separator characters. Standard Unicode triangles —
+// the previous `\ue0b0` / `\ue0b2` were Private Use Area glyphs that
+// rendered as `?` unless the terminal font was a Nerd Font / Powerline
+// patched font.
 const (
-	plRight = "\ue0b0" //  right arrow separator
-	plLeft  = "\ue0b2" //  left arrow separator
+	plRight = "▶"
+	plLeft  = "◀"
 )
 
 // Segment colors

@@ -28,6 +28,7 @@ func main() {
 	rootCmd.PersistentFlags().String("llm-key", "", "llm-server API key (llm-server/sidecar modes)")
 	rootCmd.PersistentFlags().String("llm-model", "", "llm-server model id (llm-server/sidecar modes)")
 	rootCmd.PersistentFlags().String("llm-target-port", "", "X-Target-Port header (LLM Lab vLLM instance, default 8085)")
+	rootCmd.PersistentFlags().String("llm-backend", "", "Which LLMBackend the CLI uses to fulfil host `llm.chat` calls: llm-server (default, vLLM) | gemini (REST). Reads BANYA_MAIN_PROVIDER when unset.")
 	rootCmd.PersistentFlags().StringP("server", "s", "", "Remote banya-core URL (remote mode only)")
 	rootCmd.PersistentFlags().StringP("api-key", "k", "", "API key for remote banya-core")
 	rootCmd.PersistentFlags().String("theme", "", "UI theme: dark, light")
@@ -41,6 +42,7 @@ func main() {
 	rootCmd.AddCommand(setupCmd())
 	rootCmd.AddCommand(serveCmd())
 	rootCmd.AddCommand(runCmd())
+	rootCmd.AddCommand(evalCmd())
 
 	if err := rootCmd.Execute(); err != nil {
 		os.Exit(1)
@@ -158,6 +160,11 @@ func configCmd() *cobra.Command {
 			fmt.Printf("Config file:    %s\n", config.ConfigFilePath())
 			fmt.Printf("Transport:      %s\n", cfg.Mode)
 			fmt.Printf("Prompt mode:    %s\n", cfg.PromptMode)
+			lang := cfg.Language
+			if lang == "" {
+				lang = config.LanguageKorean
+			}
+			fmt.Printf("Language:       %s\n", lang)
 			fmt.Printf("Sidecar path:   %s\n", cfg.Sidecar.Path)
 			fmt.Printf("LLM server URL: %s\n", cfg.LLMServer.URL)
 			fmt.Printf("LLM model:      %s\n", cfg.LLMServer.Model)

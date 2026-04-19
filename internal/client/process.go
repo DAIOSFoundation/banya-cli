@@ -24,6 +24,10 @@ import (
 type ProcessClient struct {
 	binPath string
 	backend LLMBackend
+	// extraEnv is merged onto os.Environ() when the sidecar is spawned.
+	// Used to pass subagent / critic config (BANYA_SUBAGENT_*) through
+	// the /settings TUI without round-tripping through the IPC protocol.
+	extraEnv []string
 
 	mu     sync.Mutex
 	cmd    *exec.Cmd
@@ -43,6 +47,52 @@ type ProcessClient struct {
 // SetLLMBackend registers a backend to fulfill sidecar-initiated `llm.chat`
 // calls. Must be set before the sidecar starts issuing inbound requests.
 func (c *ProcessClient) SetLLMBackend(b LLMBackend) { c.backend = b }
+
+// SetExtraEnv stores KEY=VALUE pairs that are appended to the sidecar
+// process environment on spawn. Call before the first request so the
+// env is present when start() runs. Safe to call with nil/empty slice
+// to clear.
+func (c *ProcessClient) SetExtraEnv(env []string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if len(env) == 0 {
+		c.extraEnv = nil
+		return
+	}
+	c.extraEnv = append([]string(nil), env...)
+}
+
+// SubagentEnvVars renders provider/model/apiKey/endpoint as KEY=VALUE
+// env strings for the banya-core sidecar. Returns nil if every field
+// is empty so callers can skip SetExtraEnv entirely.
+//
+// Defined here (not in internal/app or cmd/banya) so run.go, serve.go,
+// and the TUI path all share one helper without introducing a new
+// package or import cycles.
+func SubagentEnvVars(provider, model, apiKey, endpoint string) []string {
+	if provider == "" && model == "" && apiKey == "" {
+		return nil
+	}
+	env := []string{
+		"BANYA_SUBAGENT_PROVIDER=" + provider,
+		"BANYA_SUBAGENT_MODEL=" + model,
+		"BANYA_SUBAGENT_API_KEY=" + apiKey,
+	}
+	if endpoint != "" {
+		env = append(env, "BANYA_SUBAGENT_ENDPOINT="+endpoint)
+	}
+	return env
+}
+
+// LanguageEnvVar renders the default language preference as a single
+// BANYA_LANGUAGE=KEY env string. Returns "" if lang is empty so callers
+// can skip the append cleanly.
+func LanguageEnvVar(lang string) string {
+	if lang == "" {
+		return ""
+	}
+	return "BANYA_LANGUAGE=" + lang
+}
 
 // NewProcessClient creates a sidecar-backed Client. binPath may be empty;
 // ResolveSidecarPath is used to find the executable.
@@ -117,6 +167,9 @@ func (c *ProcessClient) start() error {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cmd := exec.CommandContext(ctx, c.binPath)
+	if len(c.extraEnv) > 0 {
+		cmd.Env = append(os.Environ(), c.extraEnv...)
+	}
 
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
@@ -368,7 +421,12 @@ func (c *ProcessClient) SendApproval(resp protocol.ApprovalResponse) error {
 
 // HealthCheck pings the sidecar, verifying it is running and responsive.
 func (c *ProcessClient) HealthCheck() error {
-	resp, err := c.call(protocol.MethodPing, nil, 5*time.Second)
+	// 30s — generous cap because the sidecar boots bun + the full Core
+	// module graph on first spawn. On a cold FS cache (e.g. background
+	// nohup run right after a build) this can exceed 10s; tight 5s caps
+	// produced silent tools=0 task failures on the 20-task smoke even
+	// though the core process was healthy, just slow to answer ping.
+	resp, err := c.call(protocol.MethodPing, nil, 30*time.Second)
 	if err != nil {
 		return err
 	}

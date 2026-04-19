@@ -14,7 +14,7 @@ var (
 	promptSep = lipgloss.Color("#00AAAA")
 )
 
-const plArrow = "\ue0b0" //
+const plArrow = "▶"
 
 // InputModel manages the user text input area.
 type InputModel struct {

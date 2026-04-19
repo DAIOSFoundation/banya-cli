@@ -131,9 +131,14 @@ func (c *LLMServerClient) Chat(ctx context.Context, params protocol.LlmChatParam
 		messages = append(messages, openaiMessage{Role: string(m.Role), Content: m.Content})
 	}
 
-	model := params.Model
+	// The client-configured model (from --llm-model flag or config.yaml)
+	// takes precedence: banya-core sometimes sends an internal alias like
+	// "host" which the upstream llm-server does not recognise. Falling back
+	// to params.Model only when no client model is set preserves legacy
+	// behaviour for tests that explicitly pass a model through params.
+	model := c.model
 	if model == "" {
-		model = c.model
+		model = params.Model
 	}
 
 	reqBody := openaiChatRequest{
@@ -156,11 +161,15 @@ func (c *LLMServerClient) Chat(ctx context.Context, params protocol.LlmChatParam
 				},
 			})
 		}
-		// Some llm-server backends (vLLM) require --enable-auto-tool-choice
-		// to accept tool_choice="auto". Defer to the server's default
-		// unless the caller was explicit.
+		// Mirror banya-eval's sidecar harness: when tools are present but
+		// the caller didn't set tool_choice, force "auto". vLLM with
+		// --enable-auto-tool-choice otherwise falls back to text-only
+		// output for this model, so the agent never actually invokes
+		// CREATE_FILE / RUN_COMMAND even when the prompt demands it.
 		if params.ToolChoice != nil {
 			reqBody.ToolChoice = params.ToolChoice
+		} else {
+			reqBody.ToolChoice = "auto"
 		}
 	}
 

@@ -7,8 +7,10 @@ import (
 	"github.com/charmbracelet/lipgloss"
 )
 
-// Powerline arrow
-const plSep = "\ue0b0"
+// Powerline-style separator. Standard Unicode glyph so it renders in any
+// monospace font — the previous `\ue0b0` required a Nerd Font and showed
+// up as `?` without one.
+const plSep = "▶"
 
 // Base style for the full-screen black background.
 var baseStyle = lipgloss.NewStyle().
@@ -27,7 +29,9 @@ func (m Model) View() string {
 	sections = append(sections, m.statusBar.View())
 
 	// Welcome banner or main content
-	if m.showBanner && len(m.messages) == 0 && m.state == StateReady {
+	if m.state == StateSettings && m.settings != nil {
+		sections = append(sections, m.settings.View())
+	} else if m.showBanner && len(m.messages) == 0 && m.state == StateReady {
 		headerHeight := 1
 		inputHeight := 3 // 2-line prompt + 1
 		helpHeight := 1
@@ -56,6 +60,9 @@ func (m Model) View() string {
 		sections = append(sections, renderStreamingBar(m.spinner.View()))
 	case StateApproval:
 		sections = append(sections, renderApprovalBar())
+	case StateSettings:
+		// settings 폼이 이미 키 안내를 포함하므로 상태바만 가볍게 표시.
+		sections = append(sections, renderSettingsBar())
 	}
 
 	// Help line — powerline style
@@ -82,6 +89,22 @@ func renderStreamingBar(spinnerView string) string {
 	return seg + sep + detail
 }
 
+// renderSettingsBar shows a powerline-style banner while the settings
+// form is open.
+func renderSettingsBar() string {
+	seg := lipgloss.NewStyle().
+		Background(lipgloss.Color("#1e3a8a")).Foreground(lipgloss.Color("#ffffff")).Bold(true).
+		Padding(0, 1).
+		Render("⚙ 설정")
+	sep := lipgloss.NewStyle().
+		Foreground(lipgloss.Color("#1e3a8a")).
+		Render(plSep)
+	detail := lipgloss.NewStyle().
+		Foreground(lipgloss.Color("#00FF41")).
+		Render("  Subagent / critic 모델 설정 중 · Esc 로 취소")
+	return seg + sep + detail
+}
+
 // renderApprovalBar shows a powerline-style approval prompt.
 func renderApprovalBar() string {
 	seg := lipgloss.NewStyle().
@@ -102,11 +125,13 @@ func renderHelpBar(state State, width int) string {
 	var keys []string
 	switch state {
 	case StateReady:
-		keys = []string{"Enter:전송", "Ctrl+T:디버그", "/clear:초기화", "/quit:종료", "Ctrl+C:종료"}
+		keys = []string{"Enter:전송", "Ctrl+T:디버그", "/settings:모델설정", "/clear:초기화", "/quit:종료", "Ctrl+C:종료"}
 	case StateStreaming:
 		keys = []string{"Ctrl+T:디버그", "Ctrl+C:종료"}
 	case StateApproval:
 		keys = []string{"Enter:승인", "Esc:거부", "Ctrl+T:디버그", "Ctrl+C:종료"}
+	case StateSettings:
+		keys = []string{"Tab:다음필드", "Enter:확인/Submit", "Esc:취소", "Ctrl+C:종료"}
 	}
 
 	seg := lipgloss.NewStyle().

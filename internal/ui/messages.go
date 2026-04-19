@@ -36,3 +36,4 @@ type ApprovalResultMsg struct {
 	ToolCallID string
 	Approved   bool
 }
+

@@ -24,6 +24,7 @@ const (
 	StateReady    State = iota // waiting for user input
 	StateStreaming             // receiving streamed response
 	StateApproval              // waiting for user to approve a tool call
+	StateSettings              // in-TUI settings form (huh-based)
 )
 
 // Model is the main Bubble Tea model for the banya TUI.
@@ -82,6 +83,9 @@ type Model struct {
 	// Active prompt mode (code | ask | plan | agent). Selects which
 	// system prompt Core composes for each chat turn.
 	promptMode protocol.PromptType
+
+	// Settings screen (StateSettings). Nil when not active.
+	settings *components.SettingsModel
 }
 
 // New creates a new TUI model.
@@ -146,6 +150,21 @@ func (m *Model) SetPromptMode(mode protocol.PromptType) error {
 		return nil
 	}
 	return fmt.Errorf("invalid prompt mode: %s", mode)
+}
+
+// SetLanguage persists the new default language to disk and updates the
+// in-memory config. Effective on next sidecar spawn (i.e. after /new or
+// restart) because PromptComposer reads the env var once at bootstrap.
+func (m *Model) SetLanguage(lang string) error {
+	norm := config.NormalizeLanguage(lang)
+	if norm == "" {
+		return fmt.Errorf("invalid language: %s (want ko | en)", lang)
+	}
+	if err := config.SaveLanguage(norm); err != nil {
+		return err
+	}
+	m.cfg.Language = norm
+	return nil
 }
 
 // Init sets up initial commands.

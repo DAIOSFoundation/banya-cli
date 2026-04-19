@@ -5,6 +5,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/cascadecodes/banya-cli/internal/client"
 	"github.com/cascadecodes/banya-cli/internal/ui/commands"
+	"github.com/cascadecodes/banya-cli/internal/ui/components"
 	"github.com/cascadecodes/banya-cli/pkg/protocol"
 )
 
@@ -20,6 +21,9 @@ func (m Model) runSlashCommand(line string) (tea.Model, tea.Cmd) {
 		},
 		SetPromptMode: func(mode protocol.PromptType) error {
 			return (&m).SetPromptMode(mode)
+		},
+		SetLanguage: func(lang string) error {
+			return (&m).SetLanguage(lang)
 		},
 	}
 	res := m.commands.Dispatch(line, ctx)
@@ -117,6 +121,37 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case ApprovalResultMsg:
 		return m.handleApprovalResult(msg)
 
+	case commands.OpenSettingsMsg:
+		// Emitted by the /settings slash command. Seed the form with the
+		// current Subagent config so the user can tweak instead of
+		// re-entering from scratch.
+		sm := components.NewSettingsModel(m.cfg.Subagent, m.cfg.Language)
+		m.settings = &sm
+		m.state = StateSettings
+		m.input.Blur()
+		m.lastError = ""
+		return m, sm.Init()
+
+	case components.SettingsClosedMsg:
+		// Settings form submitted or cancelled. Apply the result to the
+		// in-memory cfg (saved to disk by the form itself) and return
+		// the input focus.
+		if msg.Result.Saved {
+			m.cfg.Subagent = msg.Result.Subagent
+			if msg.Result.Language != "" {
+				m.cfg.Language = msg.Result.Language
+			}
+			m.addSystemMessage("설정 저장됨 (언어: " + m.cfg.Language + "). 다음 sidecar 재시작 시 적용 (`/new` 후 재시작 또는 CLI 종료/재실행).")
+		} else if msg.Result.Err != nil {
+			m.lastError = "settings save failed: " + msg.Result.Err.Error()
+		} else {
+			m.addSystemMessage("설정 취소됨.")
+		}
+		m.settings = nil
+		m.state = StateReady
+		cmds = append(cmds, m.input.Focus())
+		m.updateViewportContent()
+
 	case spinner.TickMsg:
 		var cmd tea.Cmd
 		m.spinner, cmd = m.spinner.Update(msg)
@@ -141,6 +176,16 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		cmds = append(cmds, inputCmd)
 	}
 
+	// StateSettings: forward non-key msgs to the form so async cmds
+	// (huh internal ticks 등) 이 처리됨.
+	if m.state == StateSettings && m.settings != nil {
+		if _, isKey := msg.(tea.KeyMsg); !isKey {
+			next, cmd := m.settings.Update(msg)
+			m.settings = &next
+			cmds = append(cmds, cmd)
+		}
+	}
+
 	var vpCmd tea.Cmd
 	m.viewport, vpCmd = m.viewport.Update(msg)
 	cmds = append(cmds, vpCmd)
@@ -150,6 +195,17 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 // handleKeyPress processes keyboard input.
 func (m Model) handleKeyPress(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	// StateSettings 는 huh form 이 전담 — ctrl+c 만 글로벌로 가로채고 나머지는
+	// 통째로 폼에 전달.
+	if m.state == StateSettings && m.settings != nil {
+		if msg.String() == "ctrl+c" {
+			return m, tea.Quit
+		}
+		next, cmd := m.settings.Update(msg)
+		m.settings = &next
+		return m, cmd
+	}
+
 	switch msg.String() {
 	case "ctrl+c", "ctrl+d":
 		return m, tea.Quit

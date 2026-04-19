@@ -84,11 +84,22 @@ func buildClient(cfg *config.Config, apiKey string) (client.Client, error) {
 			return nil, err
 		}
 		pc.SetLLMBackend(backend)
+		// Propagate Subagent config (critic 모델 등) through env so
+		// banya-core 가 자동 bootstrap. /settings 로 값이 바뀌면 현재
+		// 프로세스는 그대로, 다음 CLI 시작 시 적용.
+		env := client.SubagentEnvVars(cfg.Subagent.Provider, cfg.Subagent.Model, cfg.Subagent.APIKey, cfg.Subagent.Endpoint)
+		if v := client.LanguageEnvVar(cfg.Language); v != "" {
+			env = append(env, v)
+		}
+		if len(env) > 0 {
+			pc.SetExtraEnv(env)
+		}
 		return pc, nil
 	default:
 		return nil, fmt.Errorf("unknown mode %q (want sidecar|remote)", cfg.Mode)
 	}
 }
+
 
 // ensureNerdFont checks for a Nerd Font and offers to install one if missing.
 func ensureNerdFont() {

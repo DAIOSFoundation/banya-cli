@@ -59,6 +59,13 @@ func runServe(cmd *cobra.Command, _ []string) error {
 	pc.SetLLMBackend(client.NewLLMServerClientWithTarget(
 		cfg.LLMServer.URL, cfg.LLMServer.APIKey, cfg.LLMServer.Model, cfg.LLMServer.TargetPort,
 	))
+	env := client.SubagentEnvVars(cfg.Subagent.Provider, cfg.Subagent.Model, cfg.Subagent.APIKey, cfg.Subagent.Endpoint)
+	if v := client.LanguageEnvVar(cfg.Language); v != "" {
+		env = append(env, v)
+	}
+	if len(env) > 0 {
+		pc.SetExtraEnv(env)
+	}
 
 	if err := pc.HealthCheck(); err != nil {
 		return fmt.Errorf("sidecar health check failed: %w", err)

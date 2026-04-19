@@ -5,10 +5,18 @@ import (
 	"runtime"
 	"strings"
 
+	tea "github.com/charmbracelet/bubbletea"
 	"github.com/cascadecodes/banya-cli/internal/client"
+	"github.com/cascadecodes/banya-cli/internal/config"
 	"github.com/cascadecodes/banya-cli/pkg/protocol"
 	"github.com/google/uuid"
 )
+
+// OpenSettingsMsg is emitted by /settings and triggers the main UI
+// model to switch into StateSettings. Lives in this package so the
+// commands handler can return it as a tea.Cmd without importing
+// internal/ui (which would cause a cycle).
+type OpenSettingsMsg struct{}
 
 func (r *Registry) registerDefaults() {
 	r.Register(&Command{
@@ -100,6 +108,44 @@ func (r *Registry) registerDefaults() {
 		Summary: "Print client + protocol version",
 		Handler: versionHandler,
 	})
+	r.Register(&Command{
+		Name:    "settings",
+		Usage:   "/settings",
+		Summary: "Open the interactive settings screen (language, subagent/critic model)",
+		Handler: func(_ Context, _ []string) Result {
+			return Result{
+				Cmd: func() tea.Msg { return OpenSettingsMsg{} },
+			}
+		},
+	})
+	r.Register(&Command{
+		Name:    "language",
+		Aliases: []string{"lang"},
+		Usage:   "/language [ko|en]",
+		Summary: "Show or set the default response language (ko | en). Per-turn input language still wins.",
+		Handler: languageHandler,
+	})
+}
+
+func languageHandler(ctx Context, args []string) Result {
+	current := ctx.Config.Language
+	if current == "" {
+		current = config.LanguageKorean
+	}
+	if len(args) == 0 {
+		return Result{Output: "language: " + current + "  (choices: ko | en)"}
+	}
+	next := config.NormalizeLanguage(args[0])
+	if next == "" {
+		return Result{Output: "unknown language: " + args[0] + "  (want ko | en)"}
+	}
+	if ctx.SetLanguage == nil {
+		return Result{Output: "language setter not wired in this client"}
+	}
+	if err := ctx.SetLanguage(next); err != nil {
+		return Result{Output: "failed to save language: " + err.Error()}
+	}
+	return Result{Output: "language → " + next + " (takes effect after `/new` or CLI restart)"}
 }
 
 func promptModeHandler(ctx Context, args []string) Result {
@@ -146,6 +192,7 @@ func configHandler(ctx Context, _ []string) Result {
 	c := ctx.Config
 	return Result{Output: strings.Join([]string{
 		fmt.Sprintf("mode:         %s", safeMode(c.Mode)),
+		fmt.Sprintf("language:     %s", orDefault(c.Language, config.LanguageKorean)),
 		fmt.Sprintf("sidecar path: %s", orDefault(c.Sidecar.Path, "(auto-resolved)")),
 		fmt.Sprintf("llm url:      %s", c.LLMServer.URL),
 		fmt.Sprintf("llm model:    %s", c.LLMServer.Model),
