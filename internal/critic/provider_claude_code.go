@@ -119,9 +119,17 @@ func (p *ClaudeCodeProvider) Review(ctx context.Context, args ReviewArgs) (strin
 	cliCtx, cancel := context.WithTimeout(ctx, p.Timeout)
 	defer cancel()
 
-	cliArgs := []string{
-		"-p",
-		"--bare",
+	// `--bare` strictly reads auth from ANTHROPIC_API_KEY / apiKeyHelper
+	// and skips the OAuth + keychain fallback. That's the right isolation
+	// when a key is provisioned, but it breaks interactive developer
+	// environments where the only credential is the OAuth session set up
+	// by `claude /login`. Enable --bare only when a key is present in
+	// the process env; otherwise fall back to the user's existing auth.
+	cliArgs := []string{"-p"}
+	if os.Getenv("ANTHROPIC_API_KEY") != "" {
+		cliArgs = append(cliArgs, "--bare")
+	}
+	cliArgs = append(cliArgs,
 		"--print",
 		"--output-format", "json",
 		"--model", p.Model,
@@ -131,7 +139,7 @@ func (p *ClaudeCodeProvider) Review(ctx context.Context, args ReviewArgs) (strin
 		"--permission-mode", "bypassPermissions",
 		"--setting-sources", "",
 		"--no-session-persistence",
-	}
+	)
 	if addDir != "" {
 		// `--add-dir` accepts multiple values space-separated, but the
 		// safe form is repeat-the-flag.
