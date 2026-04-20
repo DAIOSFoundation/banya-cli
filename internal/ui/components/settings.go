@@ -20,7 +20,11 @@ type SettingsResult struct {
 	Saved    bool
 	Subagent config.SubagentConfig
 	Language string // ko | en — default language written to config
-	Err      error
+	// LLMPresetID is non-empty when the user switched the main model
+	// preset. The UI layer applies it via Model.ApplyLLMPreset so the
+	// running ProcessClient's LLMBackend swaps without restart.
+	LLMPresetID string
+	Err         error
 }
 
 // SettingsClosedMsg is emitted by the Settings model (via tea.Cmd) to
@@ -33,36 +37,61 @@ type SettingsClosedMsg struct {
 // SettingsModel wraps a huh.Form that edits SubagentConfig + the global
 // language preference.
 type SettingsModel struct {
-	form     *huh.Form
-	provider string
-	model    string
-	apiKey   string
-	endpoint string
-	language string // ko | en
-	done     bool
-	result   SettingsResult
-	width    int
-	height   int
+	form        *huh.Form
+	provider    string
+	model       string
+	apiKey      string
+	endpoint    string
+	language    string // ko | en
+	llmPresetID string // "" means keep current; otherwise one of LLMPresets.ID
+	done        bool
+	result      SettingsResult
+	width       int
+	height      int
 }
 
 // NewSettingsModel seeds the form with current config values.
-func NewSettingsModel(current config.SubagentConfig, currentLang string) SettingsModel {
+func NewSettingsModel(current config.SubagentConfig, currentLang string, currentLLM config.LLMServerConfig) SettingsModel {
 	if currentLang == "" {
 		currentLang = config.LanguageKorean
 	}
+	llmID := ""
+	if p := config.MatchPresetFromConfig(currentLLM); p != nil {
+		llmID = p.ID
+	}
 	s := SettingsModel{
-		provider: current.Provider,
-		model:    current.Model,
-		apiKey:   current.APIKey,
-		endpoint: current.Endpoint,
-		language: currentLang,
+		provider:    current.Provider,
+		model:       current.Model,
+		apiKey:      current.APIKey,
+		endpoint:    current.Endpoint,
+		language:    currentLang,
+		llmPresetID: llmID,
 	}
 	s.form = buildForm(&s)
 	return s
 }
 
 func buildForm(s *SettingsModel) *huh.Form {
+	// Main-model options derived from config.LLMPresets.
+	mainOpts := []huh.Option[string]{huh.NewOption("(keep current)", "")}
+	for _, p := range config.LLMPresets {
+		label := p.Label
+		if p.Beta {
+			label += " [beta]"
+		}
+		mainOpts = append(mainOpts, huh.NewOption(label, p.ID))
+	}
+
 	return huh.NewForm(
+		huh.NewGroup(
+			huh.NewNote().
+				Title("Main Agent Model").
+				Description("Primary LLM the agent uses for reasoning + tool calls. Switching here hot-swaps the backend on submit; the API key must be exported via the preset's env var (shown in /model)."),
+			huh.NewSelect[string]().
+				Title("Main model preset").
+				Options(mainOpts...).
+				Value(&s.llmPresetID),
+		),
 		huh.NewGroup(
 			huh.NewNote().
 				Title("Language / 언어").
@@ -139,8 +168,17 @@ func (m SettingsModel) Update(msg tea.Msg) (SettingsModel, tea.Cmd) {
 		if err == nil {
 			err = config.SaveLanguage(m.language)
 		}
+		// Note: main-model preset change is applied by the caller via
+		// Model.ApplyLLMPreset when LLMPresetID is non-empty — it does
+		// both config persistence and ProcessClient backend swap.
 		m.done = true
-		m.result = SettingsResult{Saved: err == nil, Subagent: sub, Language: m.language, Err: err}
+		m.result = SettingsResult{
+			Saved:       err == nil,
+			Subagent:    sub,
+			Language:    m.language,
+			LLMPresetID: m.llmPresetID,
+			Err:         err,
+		}
 		return m, func() tea.Msg { return SettingsClosedMsg{Result: m.result} }
 	}
 	return m, cmd

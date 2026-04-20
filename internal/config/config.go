@@ -230,6 +230,33 @@ func SaveLanguage(lang string) error {
 	return nil
 }
 
+// SaveLLMServer persists the main-agent LLM config. The API key is
+// intentionally NOT written to disk — presets resolve it from env vars
+// at load time so we never copy secrets into config.yaml.
+func SaveLLMServer(cfg LLMServerConfig) error {
+	if err := EnsureDirs(); err != nil {
+		return err
+	}
+	v := viper.New()
+	v.SetConfigName("config")
+	v.SetConfigType("yaml")
+	v.AddConfigPath(configDir())
+	if err := v.ReadInConfig(); err != nil {
+		if _, ok := err.(viper.ConfigFileNotFoundError); !ok {
+			return fmt.Errorf("read config: %w", err)
+		}
+	}
+	v.Set("llm_server.url", cfg.URL)
+	v.Set("llm_server.model", cfg.Model)
+	v.Set("llm_server.target_port", cfg.TargetPort)
+	// Deliberately NOT setting api_key — the key lives in the env.
+	out := filepath.Join(configDir(), "config.yaml")
+	if err := v.WriteConfigAs(out); err != nil {
+		return fmt.Errorf("write config: %w", err)
+	}
+	return nil
+}
+
 // SaveSubagent persists the subagent config to the on-disk config file.
 // Other config sections are preserved (viper re-reads the file first).
 // Called by the /settings TUI after the user submits the form.

@@ -167,6 +167,39 @@ func (m *Model) SetLanguage(lang string) error {
 	return nil
 }
 
+// ApplyLLMPreset swaps the main-agent LLM at runtime. Persists the URL/
+// model/target_port to config.yaml (not the API key) and replaces the
+// ProcessClient's LLMBackend so the next llm.chat call lands on the new
+// endpoint. The sidecar itself keeps running — banya-core only sees the
+// model name it was spawned with (--llm-model flag), but banya-cli is
+// the actual HTTP caller for chat completions, so the swap takes effect
+// immediately for LLM traffic. Model-name-dependent prompt hints inside
+// banya-core will update on next /new (fresh session).
+func (m *Model) ApplyLLMPreset(presetID string) error {
+	p := config.LookupPreset(presetID)
+	if p == nil {
+		return fmt.Errorf("unknown preset: %s", presetID)
+	}
+	resolved := p.Resolve()
+	if resolved.APIKey == "" {
+		return fmt.Errorf(
+			"preset %s requires env var %s to be set (API key)",
+			p.ID, p.APIKeyEnv,
+		)
+	}
+	// Swap the backend on the process client if we're in sidecar mode.
+	if pc, ok := m.client.(*client.ProcessClient); ok {
+		pc.SetLLMBackend(client.NewLLMServerClientWithTarget(
+			resolved.URL, resolved.APIKey, resolved.Model, resolved.TargetPort,
+		))
+	}
+	if err := config.SaveLLMServer(resolved); err != nil {
+		return fmt.Errorf("save config: %w", err)
+	}
+	m.cfg.LLMServer = resolved
+	return nil
+}
+
 // Init sets up initial commands.
 func (m Model) Init() tea.Cmd {
 	return tea.Batch(

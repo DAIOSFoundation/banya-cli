@@ -34,6 +34,13 @@ type Context struct {
 	// values are normalised codes (ko | en). Returns an error on invalid
 	// input or disk failure.
 	SetLanguage func(lang string) error
+
+	// ApplyLLMPreset swaps the main-agent backend at runtime. Persists
+	// the preset to config.yaml (minus secrets) and hot-swaps the
+	// ProcessClient's LLMBackend so the next llm.chat routes to the new
+	// endpoint without restart. Returns an error if the preset is
+	// unknown or its API-key env var is empty.
+	ApplyLLMPreset func(presetID string) error
 }
 
 // Result describes what the UI should show after a command runs.

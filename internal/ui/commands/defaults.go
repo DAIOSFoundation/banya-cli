@@ -125,6 +125,79 @@ func (r *Registry) registerDefaults() {
 		Summary: "Show or set the default response language (ko | en). Per-turn input language still wins.",
 		Handler: languageHandler,
 	})
+	r.Register(&Command{
+		Name:    "model",
+		Aliases: []string{"llm"},
+		Usage:   "/model [id|index]",
+		Summary: "Show or switch the main LLM preset (qwen | gemini | claude-opus)",
+		Handler: modelHandler,
+	})
+}
+
+func modelHandler(ctx Context, args []string) Result {
+	current := config.MatchPresetFromConfig(ctx.Config.LLMServer)
+
+	if len(args) == 0 {
+		// List + mark current.
+		var b strings.Builder
+		b.WriteString("LLM presets (use `/model <id>` to switch):\n")
+		for i, p := range config.LLMPresets {
+			mark := "  "
+			if current != nil && current.ID == p.ID {
+				mark = "* "
+			}
+			beta := ""
+			if p.Beta {
+				beta = "  [beta]"
+			}
+			fmt.Fprintf(&b, "%s%d. %s (%s)%s\n    %s\n    env: %s\n",
+				mark, i+1, p.Label, p.ID, beta, p.Description, p.APIKeyEnv)
+		}
+		if current == nil {
+			b.WriteString("\n(current LLM config doesn't match any preset — hand-edited config.yaml)")
+		}
+		return Result{Output: strings.TrimRight(b.String(), "\n")}
+	}
+
+	// Accept either preset ID or 1-based index.
+	arg := strings.ToLower(args[0])
+	var target *config.LLMPreset
+	if idx, err := parsePresetIndex(arg); err == nil && idx >= 0 && idx < len(config.LLMPresets) {
+		target = &config.LLMPresets[idx]
+	} else {
+		target = config.LookupPreset(arg)
+	}
+	if target == nil {
+		return Result{Output: "unknown preset: " + args[0] + "  (try /model to list)"}
+	}
+	if ctx.ApplyLLMPreset == nil {
+		return Result{Output: "model switcher not wired in this client"}
+	}
+	if err := ctx.ApplyLLMPreset(target.ID); err != nil {
+		return Result{Output: "failed to apply preset " + target.ID + ": " + err.Error()}
+	}
+	msg := "model → " + target.Label + "  (" + target.Model + ")"
+	if target.Beta {
+		msg += "  [beta — verify tool calls work]"
+	}
+	return Result{Output: msg}
+}
+
+func parsePresetIndex(s string) (int, error) {
+	// 1-based → 0-based. Accept "1", "2", "3".
+	switch s {
+	case "1":
+		return 0, nil
+	case "2":
+		return 1, nil
+	case "3":
+		return 2, nil
+	case "4":
+		return 3, nil
+	case "5":
+		return 4, nil
+	}
+	return -1, fmt.Errorf("not an index")
 }
 
 func languageHandler(ctx Context, args []string) Result {
@@ -190,16 +263,25 @@ func (r *Registry) helpHandler(_ Context, _ []string) Result {
 
 func configHandler(ctx Context, _ []string) Result {
 	c := ctx.Config
+	presetLine := fmt.Sprintf("llm preset:   %s", presetLabel(c.LLMServer))
 	return Result{Output: strings.Join([]string{
 		fmt.Sprintf("mode:         %s", safeMode(c.Mode)),
 		fmt.Sprintf("language:     %s", orDefault(c.Language, config.LanguageKorean)),
 		fmt.Sprintf("sidecar path: %s", orDefault(c.Sidecar.Path, "(auto-resolved)")),
+		presetLine,
 		fmt.Sprintf("llm url:      %s", c.LLMServer.URL),
 		fmt.Sprintf("llm model:    %s", c.LLMServer.Model),
 		fmt.Sprintf("remote url:   %s", c.Server.URL),
 		fmt.Sprintf("theme:        %s", c.UI.Theme),
 		fmt.Sprintf("shell:        %s", c.Shell.Shell),
 	}, "\n")}
+}
+
+func presetLabel(c config.LLMServerConfig) string {
+	if p := config.MatchPresetFromConfig(c); p != nil {
+		return p.Label + " (" + p.ID + ")"
+	}
+	return "(custom — not on preset list)"
 }
 
 func sidecarHandler(ctx Context, _ []string) Result {

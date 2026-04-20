@@ -25,6 +25,9 @@ func (m Model) runSlashCommand(line string) (tea.Model, tea.Cmd) {
 		SetLanguage: func(lang string) error {
 			return (&m).SetLanguage(lang)
 		},
+		ApplyLLMPreset: func(id string) error {
+			return (&m).ApplyLLMPreset(id)
+		},
 	}
 	res := m.commands.Dispatch(line, ctx)
 
@@ -125,7 +128,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// Emitted by the /settings slash command. Seed the form with the
 		// current Subagent config so the user can tweak instead of
 		// re-entering from scratch.
-		sm := components.NewSettingsModel(m.cfg.Subagent, m.cfg.Language)
+		sm := components.NewSettingsModel(m.cfg.Subagent, m.cfg.Language, m.cfg.LLMServer)
 		m.settings = &sm
 		m.state = StateSettings
 		m.input.Blur()
@@ -141,7 +144,15 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if msg.Result.Language != "" {
 				m.cfg.Language = msg.Result.Language
 			}
-			m.addSystemMessage("설정 저장됨 (언어: " + m.cfg.Language + "). 다음 sidecar 재시작 시 적용 (`/new` 후 재시작 또는 CLI 종료/재실행).")
+			extra := ""
+			if msg.Result.LLMPresetID != "" {
+				if err := (&m).ApplyLLMPreset(msg.Result.LLMPresetID); err != nil {
+					extra = "  ⚠ main model swap failed: " + err.Error()
+				} else {
+					extra = "  ✓ main model → " + msg.Result.LLMPresetID
+				}
+			}
+			m.addSystemMessage("설정 저장됨 (언어: " + m.cfg.Language + ")." + extra + " Subagent 변경은 sidecar 재시작 시 적용.")
 		} else if msg.Result.Err != nil {
 			m.lastError = "settings save failed: " + msg.Result.Err.Error()
 		} else {
