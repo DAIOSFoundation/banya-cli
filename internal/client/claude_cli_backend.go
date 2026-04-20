@@ -108,7 +108,9 @@ func (b *ClaudeCliBackend) Chat(
 	cmd := exec.CommandContext(ctx, b.binary, args...)
 	cmd.Env = os.Environ()
 
+	start := time.Now()
 	out, err := cmd.Output()
+	elapsed := time.Since(start)
 	if err != nil {
 		// Surface stderr tail — most Claude CLI failures are "not
 		// signed in" / quota / unknown model, and all of those are
@@ -128,6 +130,16 @@ func (b *ClaudeCliBackend) Chat(
 	text, parseErr := parseClaudeJsonOutput(out)
 	if parseErr != nil {
 		return "", "", nil, parseErr
+	}
+
+	// Optional trace: log the (messages, completion) pair for offline
+	// LoRA training. Claude's native XML tool envelope IS exactly what
+	// banya-core's ToolParser expects, so these raw I/O pairs are
+	// tokenisable directly as SFT data for a Qwen adapter that learns
+	// the same format. Set BANYA_LLM_TRACE_PATH to a directory to
+	// enable; silent no-op if unset.
+	if trace := os.Getenv("BANYA_LLM_TRACE_PATH"); trace != "" {
+		appendTrace(trace, params, text, b.model, elapsed)
 	}
 
 	// Simulate streaming: a single callback at end-of-turn. banya-core
