@@ -15,6 +15,7 @@ import (
 	"github.com/cascadecodes/banya-cli/internal/config"
 	"github.com/cascadecodes/banya-cli/internal/critic"
 	"github.com/cascadecodes/banya-cli/internal/domain"
+	"github.com/cascadecodes/banya-cli/internal/webbench"
 	"github.com/cascadecodes/banya-cli/pkg/protocol"
 	"github.com/spf13/cobra"
 )
@@ -327,6 +328,77 @@ func runHeadless(cmd *cobra.Command, _ []string) error {
 	// the run even if a later revise turn drops the patch again.
 	nudgedThisRun := false
 
+	// Webbench-aware path — parallel to the SWE-bench patch.diff flow
+	// below. Detects `test/task-N.spec.js` + `playwright.config.*` and
+	// runs the same cumulative test command Web-Bench's official
+	// evaluator does (`npx playwright test test/task-1.spec.js …
+	// test/task-N.spec.js`). On any failure we fire a single nudge
+	// turn that hands the test output back to the agent. The two
+	// layouts are mutually exclusive in practice (a SWE-bench repo has
+	// `repo/` and no task specs, and vice versa), but we gate the
+	// SWE-bench blocks on `!wbLayout.Active()` below to make it
+	// explicit.
+	wbLayout := webbench.Detect(workDir)
+	if wbLayout.Active() && !noPatchNudge && exitCode != 3 {
+		emitMeta(out, map[string]any{
+			"phase":         "webbench_probe",
+			"layout":        wbLayout.DescribeShort(),
+			"current_index": wbLayout.CurrentIndex,
+			"session_id":    sessionID,
+		})
+		// Cumulative range goes up to the current task index (set by
+		// the orchestrator via BANYA_WEBBENCH_CURRENT_INDEX), not the
+		// full spec count. Earlier iterations scoped to MaxIndex and
+		// fed the agent 20 nominal failures on a task-1 attempt; the
+		// agent then tried to solve all tasks at once (80+ tool calls,
+		// 540s turns). Gating to CurrentIndex matches Web-Bench's
+		// official `npm run test -- N` semantics.
+		specs := wbLayout.SpecRange(wbLayout.CurrentIndex)
+		wbCtx, wbCancel := context.WithTimeout(cmd.Context(), 12*time.Minute)
+		tres, terr := webbench.RunCumulative(wbCtx, workDir, specs, 10*time.Minute)
+		wbCancel()
+		emitMeta(out, map[string]any{
+			"phase":        "webbench_test",
+			"all_passed":   tres.AllPassed,
+			"passed":       tres.PassedCount,
+			"failed":       tres.FailedCount,
+			"failed_specs": tres.FailedSpecs,
+			"duration_ms":  tres.Duration.Milliseconds(),
+			"timed_out":    tres.TimedOut,
+			"exit_code":    tres.ExitCode,
+			"error":        errString(terr),
+			"session_id":   sessionID,
+		})
+		if !tres.AllPassed && !nudgedThisRun && terr == nil {
+			nudgedThisRun = true
+			emitMeta(out, map[string]any{
+				"phase":      "webbench_nudge",
+				"prev_exit":  exitReason,
+				"session_id": sessionID,
+			})
+			_, exitReason, exitCode = runOneTurn(out, pc, protocol.ChatRequest{
+				SessionID:  sessionID,
+				Message:    webbench.BuildNudge(tres, len(specs) > 1),
+				WorkDir:    workDir,
+				PromptType: protocol.PromptType(promptTypeStr),
+			}, nudgeTimeout, idleAbort, thinkingAbort, autoApprove)
+			// Re-run tests so eval harnesses can record the post-nudge
+			// state without re-invoking playwright themselves.
+			wbCtx2, wbCancel2 := context.WithTimeout(cmd.Context(), 12*time.Minute)
+			tres2, _ := webbench.RunCumulative(wbCtx2, workDir, specs, 10*time.Minute)
+			wbCancel2()
+			emitMeta(out, map[string]any{
+				"phase":        "webbench_test_after_nudge",
+				"all_passed":   tres2.AllPassed,
+				"passed":       tres2.PassedCount,
+				"failed":       tres2.FailedCount,
+				"failed_specs": tres2.FailedSpecs,
+				"duration_ms":  tres2.Duration.Milliseconds(),
+				"session_id":   sessionID,
+			})
+		}
+	}
+
 	// Post-hoc nudge: the first turn ended without writing patch.diff.
 	// Agents failing this way tend to fall into two modes — they quit
 	// mid-investigation (tools=3, fast), or they loop on read_file /
@@ -334,7 +406,7 @@ func runHeadless(cmd *cobra.Command, _ []string) error {
 	// modes walk away with zero points even when the critic could
 	// rescue a wrong patch. Send a single "commit now" continuation
 	// turn with a tighter budget so the agent can lock in ANY patch.
-	if !noPatchNudge && !nudgedThisRun && exitCode != 3 && !patchExists() {
+	if !wbLayout.Active() && !noPatchNudge && !nudgedThisRun && exitCode != 3 && !patchExists() {
 		nudgedThisRun = true
 		emitMeta(out, map[string]any{
 			"phase":      "nudge",
@@ -352,8 +424,9 @@ func runHeadless(cmd *cobra.Command, _ []string) error {
 
 	// Critic phase — up to `criticMaxRounds` review→revise cycles. Stops
 	// early on: (a) critic OK, (b) revise turn errored, (c) patch did not
-	// change between rounds (agent stuck).
-	if criticEnabled && exitCode == 0 && patchExists() {
+	// change between rounds (agent stuck). Gated on non-webbench layout
+	// so the Web-Bench run doesn't try to review a nonexistent patch.diff.
+	if !wbLayout.Active() && criticEnabled && exitCode == 0 && patchExists() {
 		reviewer := critic.NewFromEnv()
 		if reviewer != nil {
 			issueText, _ := readIssueForCritic(criticIssueFile, promptText)
@@ -415,7 +488,7 @@ func runHeadless(cmd *cobra.Command, _ []string) error {
 				}
 			}
 		}
-	} else if criticEnabled && exitCode == 0 && !patchExists() {
+	} else if !wbLayout.Active() && criticEnabled && exitCode == 0 && !patchExists() {
 		emitMeta(out, map[string]any{
 			"phase":  "critic_skip",
 			"reason": "no patch.diff (even after nudge)",
@@ -763,6 +836,16 @@ func hashBytes(b []byte) uint64 {
 		h *= 1099511628211
 	}
 	return h
+}
+
+// errString lets us drop error values straight into emitMeta maps. nil
+// → empty string so the JSON payload stays compact when no error
+// occurred; otherwise the error message.
+func errString(e error) string {
+	if e == nil {
+		return ""
+	}
+	return e.Error()
 }
 
 // buildNudgePrompt is delivered as a continuation message when the first
