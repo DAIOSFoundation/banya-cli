@@ -421,12 +421,16 @@ func (c *ProcessClient) SendApproval(resp protocol.ApprovalResponse) error {
 
 // HealthCheck pings the sidecar, verifying it is running and responsive.
 func (c *ProcessClient) HealthCheck() error {
-	// 30s — generous cap because the sidecar boots bun + the full Core
-	// module graph on first spawn. On a cold FS cache (e.g. background
-	// nohup run right after a build) this can exceed 10s; tight 5s caps
-	// produced silent tools=0 task failures on the 20-task smoke even
-	// though the core process was healthy, just slow to answer ping.
-	resp, err := c.call(protocol.MethodPing, nil, 30*time.Second)
+	// 90s — the sidecar is a bash wrapper that exec's `bun run
+	// headless.ts`. First-spawn cost is dominated by bun's TS module
+	// graph load (Core + MCP + tools + prompts) which on a cold FS
+	// cache can hit 30-60s, especially under Python subprocess
+	// harness (stdout piped, not terminal). Observed reproducer-03:
+	// all 5 tasks failed at exactly 30s-33s with "rpc timeout after
+	// 30s (method=ping)" — ping wasn't failing, banya-core just hadn't
+	// finished init. Bumping to 90s is safe because chat.start has its
+	// own per-turn timeout; HealthCheck only gates the first message.
+	resp, err := c.call(protocol.MethodPing, nil, 90*time.Second)
 	if err != nil {
 		return err
 	}
