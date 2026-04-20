@@ -217,72 +217,46 @@ func runHeadless(cmd *cobra.Command, _ []string) error {
 	}
 	defer pc.Close()
 	// Backend selection: `--llm-backend` flag (cmd.Root) > BANYA_MAIN_PROVIDER
-	// env > legacy default of vllm (the on-prem Qwen stack). "gemini"
-	// routes to GeminiBackend (REST, fast — used for SIBDD dev-mode).
+	// env > legacy default of llm-server (on-prem Qwen stack). The
+	// concrete construction lives in internal/client/backend_registry.go
+	// so a new adapter = one file + one init() call, not another case
+	// branch here.
 	backendKind, _ := cmd.Root().Flags().GetString("llm-backend")
-	if backendKind == "" {
-		backendKind = os.Getenv("BANYA_MAIN_PROVIDER")
+	bcfg := client.ResolveBackendConfig()
+	if backendKind != "" {
+		bcfg.Provider = backendKind
 	}
-	switch backendKind {
-	case "gemini":
-		// Gemini via OpenAI-compat endpoint (/v1beta/openai/chat/completions).
-		// Same transport as vLLM — no new client needed. Validated in
-		// webbench.py which has been using this exact approach in
-		// production (native tool-calling works transparently).
-		//
-		// Flag-override priority: env FIRST, then `--llm-*` flags.
-		// This inverts the usual order because the harness (sidecar.py)
-		// always passes `--llm-model /models/model` + the vLLM URL as
-		// positional flags, so letting flags win would clobber our
-		// Gemini model/endpoint. In `gemini` mode those flags are
-		// effectively legacy and must be ignored.
-		apiKey := firstNonEmpty(
-			os.Getenv("BANYA_MAIN_API_KEY"),
-			os.Getenv("GEMINI_KEY"),
-		)
-		if apiKey == "" {
-			// Fall back to the flag only if env has nothing.
-			if k, _ := cmd.Root().Flags().GetString("llm-key"); k != "" {
-				apiKey = k
-			}
+	// For the llm-server path, flag-fed CLI args (--llm-url / --llm-key /
+	// --llm-model / --llm-target-port) carry what the harness passes.
+	// Layer them onto the config only when env didn't already win —
+	// gemini / claude-cli paths deliberately ignore these because the
+	// harness hard-codes the vLLM model id and URL.
+	canonical := strings.ToLower(bcfg.Provider)
+	if canonical == "" || canonical == "llm-server" || canonical == "vllm" {
+		if bcfg.Endpoint == "" {
+			bcfg.Endpoint = cfg.LLMServer.URL
 		}
-		model := firstNonEmpty(
-			os.Getenv("BANYA_MAIN_MODEL"),
-			"gemini-3-flash-preview",
-		)
-		endpoint := firstNonEmpty(
-			os.Getenv("BANYA_MAIN_ENDPOINT"),
-			"https://generativelanguage.googleapis.com/v1beta/openai",
-		)
-		// X-Target-Port is vLLM-specific; Gemini ignores it.
-		pc.SetLLMBackend(client.NewLLMServerClientWithTarget(
-			endpoint, apiKey, model, "",
-		))
-	case "gemini-native":
-		// Experimental native Gemini REST path (functionCall parsing
-		// handled by GeminiBackend directly). Kept for ablation runs;
-		// prefer `gemini` in production.
-		apiKey := firstNonEmpty(
-			os.Getenv("BANYA_MAIN_API_KEY"),
-			os.Getenv("GEMINI_KEY"),
-		)
-		model := firstNonEmpty(
-			os.Getenv("BANYA_MAIN_MODEL"),
-			cfg.LLMServer.Model,
-			"gemini-3-flash-preview",
-		)
-		if cliModel, _ := cmd.Root().Flags().GetString("llm-model"); cliModel != "" {
-			model = cliModel
+		if bcfg.APIKey == "" {
+			bcfg.APIKey = cfg.LLMServer.APIKey
 		}
-		endpoint := os.Getenv("BANYA_MAIN_ENDPOINT")
-		pc.SetLLMBackend(client.NewGeminiBackend(endpoint, apiKey, model))
-	case "", "llm-server", "vllm":
-		pc.SetLLMBackend(client.NewLLMServerClientWithTarget(
-			cfg.LLMServer.URL, cfg.LLMServer.APIKey, cfg.LLMServer.Model, cfg.LLMServer.TargetPort,
-		))
-	default:
-		return fmt.Errorf("unknown --llm-backend %q (want: gemini | gemini-native | llm-server)", backendKind)
+		if bcfg.Model == "" {
+			bcfg.Model = cfg.LLMServer.Model
+		}
+		if bcfg.TargetPort == "" {
+			bcfg.TargetPort = cfg.LLMServer.TargetPort
+		}
+	} else if bcfg.APIKey == "" {
+		// Gemini / claude-cli: fall back to --llm-key only if env
+		// really empty (historical callers set the key via the flag).
+		if k, _ := cmd.Root().Flags().GetString("llm-key"); k != "" {
+			bcfg.APIKey = k
+		}
 	}
+	backend, err := client.NewBackendFromConfig(bcfg)
+	if err != nil {
+		return fmt.Errorf("main-agent backend: %w", err)
+	}
+	pc.SetLLMBackend(backend)
 	env := client.SubagentEnvVars(cfg.Subagent.Provider, cfg.Subagent.Model, cfg.Subagent.APIKey, cfg.Subagent.Endpoint)
 	if v := client.LanguageEnvVar(cfg.Language); v != "" {
 		env = append(env, v)
