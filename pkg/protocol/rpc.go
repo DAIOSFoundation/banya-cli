@@ -131,6 +131,48 @@ type PingResult struct {
 	UptimeMs int64  `json:"uptime_ms"`
 }
 
+// SessionSummary mirrors the TS SessionSummary for `session.list`.
+// work_dir + preview are banya-cli extensions consumed by the TUI's
+// `/sessions` picker to filter to the current cwd and show a one-line
+// hint of the first user message. Older banya-core builds that don't
+// fill those leave them empty — renderer treats empty strings as
+// "not available", not as errors.
+type SessionSummary struct {
+	SessionID    string `json:"session_id"`
+	Title        string `json:"title,omitempty"`
+	UpdatedAt    string `json:"updated_at"`
+	MessageCount int    `json:"message_count"`
+	WorkDir      string `json:"work_dir,omitempty"`
+	Preview      string `json:"preview,omitempty"`
+}
+
+// SessionListResult wraps the response payload of `session.list`.
+type SessionListResult struct {
+	Sessions []SessionSummary `json:"sessions"`
+}
+
+// SessionLoadParams identifies which session to load.
+type SessionLoadParams struct {
+	SessionID string `json:"session_id"`
+}
+
+// SessionLoadResult returns the conversation history for a session.
+// Messages are in chronological order — oldest first.
+type SessionLoadResult struct {
+	Messages []Message `json:"messages"`
+}
+
+// SessionDeleteParams identifies which session to delete.
+type SessionDeleteParams struct {
+	SessionID string `json:"session_id"`
+}
+
+// SessionDeleteResult reports whether the deletion took effect. False
+// when the session id wasn't known to the sidecar.
+type SessionDeleteResult struct {
+	Deleted bool `json:"deleted"`
+}
+
 // ChatStartResult is the payload returned by the `chat.start` method
 // (before the streaming events begin).
 type ChatStartResult struct {

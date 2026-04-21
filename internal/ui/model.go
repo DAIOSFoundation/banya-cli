@@ -93,6 +93,15 @@ type Model struct {
 	// so Up/Down feels consistent even as the filter changes.
 	slashSelected int
 
+	// Session persistence lives entirely on the sidecar (banya-core's
+	// SessionManager persists conversationHistory to NDJSON on disk
+	// keyed by session_id). banya-cli is a thin client here: we only
+	// track the currently-active session id + launch dir so the
+	// /sessions picker can filter to "this workspace", and we hit the
+	// sidecar via RPC (session.list / session.load / session.delete)
+	// for everything else. No local mirror, no drift.
+	workDir string
+
 	// Creative ticker — the "thinking with emoji + word" animation that
 	// runs between the user's message and the streaming response.
 	// Fields update every ~600ms while in StateStreaming via
@@ -115,6 +124,11 @@ func New(apiClient client.Client, cfg *config.Config) Model {
 	s.Spinner = spinner.Dot
 	s.Style = theme.Spinner
 
+	// Resolve workdir once at construction — the whole session file is
+	// scoped to the dir `banya` was launched from, so an agent run in
+	// ~/project-a doesn't resurrect chat history from ~/project-b.
+	workDir, _ := os.Getwd()
+
 	m := Model{
 		state:      StateReady,
 		sessionID:  uuid.New().String(),
@@ -136,9 +150,113 @@ func New(apiClient client.Client, cfg *config.Config) Model {
 		debugHeight:  defaultDebugPanelHeight,
 		promptMode:     resolvePromptMode(cfg.PromptMode),
 		creativeTicker: newCreativeTicker(),
+		workDir:        workDir,
 	}
 	m.initStatusFromConfig()
+	// Auto-resume the most recent session for this workdir. The
+	// sidecar is authoritative now — banya-cli just asks it for the
+	// session list, finds the freshest one matching our cwd, and
+	// binds to that session id + messages. Silent on any failure
+	// (sidecar not ready yet, empty list, RPC error); the banner +
+	// fresh-uuid path takes over in that case.
+	m.tryResumeLatestSession()
 	return m
+}
+
+// tryResumeLatestSession asks the sidecar for saved sessions,
+// filters to this workdir, and adopts the most recent one. Bound to
+// the sidecar's session_id so subsequent chat.start turns let
+// banya-core's ConversationManager pull the real conversation
+// history into the LLM context. No local mirror here — UI messages
+// and sidecar history share one source of truth.
+func (m *Model) tryResumeLatestSession() {
+	sessions, err := m.client.ListSessions()
+	if err != nil || len(sessions) == 0 {
+		return
+	}
+	// ListSessions is already sorted newest-first on the sidecar; we
+	// just walk it, picking the first cwd match.
+	for _, s := range sessions {
+		if s.WorkDir != "" && s.WorkDir != m.workDir {
+			continue
+		}
+		msgs, err := m.client.LoadSession(s.SessionID)
+		if err != nil {
+			continue
+		}
+		m.sessionID = s.SessionID
+		m.messages = append(make([]protocol.Message, 0, len(msgs)), msgs...)
+		if len(m.messages) > 0 {
+			m.showBanner = false
+		}
+		return
+	}
+}
+
+// listSessions projects the sidecar's on-disk sessions into the
+// commands-layer SessionInfo shape. Filtered to the current workdir
+// so cross-project conversations don't clutter the picker. Empty
+// slice on RPC failure.
+func (m *Model) listSessions() []commands.SessionInfo {
+	sessions, err := m.client.ListSessions()
+	if err != nil {
+		return nil
+	}
+	out := make([]commands.SessionInfo, 0, len(sessions))
+	for _, s := range sessions {
+		if s.WorkDir != "" && s.WorkDir != m.workDir {
+			continue
+		}
+		updated, _ := time.Parse(time.RFC3339, s.UpdatedAt)
+		out = append(out, commands.SessionInfo{
+			ID:           s.SessionID,
+			UpdatedAt:    updated,
+			WorkDir:      s.WorkDir,
+			Preview:      s.Preview,
+			MessageCount: s.MessageCount,
+			Current:      s.SessionID == m.sessionID,
+		})
+	}
+	return out
+}
+
+// loadSession swaps the Model's view to the sidecar's saved session
+// identified by `id`. Empty id starts a blank session. Returns an
+// error only on RPC failure; an unknown id simply yields an empty
+// message list.
+func (m *Model) loadSession(id string) error {
+	if id == "" {
+		m.sessionID = uuid.New().String()
+		m.messages = m.messages[:0]
+		m.streamContent = ""
+		m.toolCalls = nil
+		m.showBanner = true
+		return nil
+	}
+	msgs, err := m.client.LoadSession(id)
+	if err != nil {
+		return err
+	}
+	m.sessionID = id
+	m.messages = append(m.messages[:0], msgs...)
+	m.streamContent = ""
+	m.toolCalls = nil
+	m.showBanner = len(m.messages) == 0
+	return nil
+}
+
+// saveCurrentAndStartNew simply rolls to a brand-new session id. The
+// sidecar's SessionManager has already been persisting this session
+// turn-by-turn (chat.start binds the id, chat/send appends to its
+// conversationHistory), so there's nothing explicit for banya-cli to
+// save — we just drop the current history from the view and hand
+// back a fresh id that the next chat.start will announce.
+func (m *Model) saveCurrentAndStartNew() string {
+	m.sessionID = uuid.New().String()
+	m.messages = m.messages[:0]
+	m.streamContent = ""
+	m.toolCalls = nil
+	return m.sessionID
 }
 
 // resolvePromptMode normalises config-provided prompt modes and falls
@@ -298,7 +416,11 @@ func readNextEvent(events <-chan protocol.ServerEvent) tea.Cmd {
 	}
 }
 
-// addUserMessage appends a user message to the conversation.
+// addUserMessage appends a user message to the conversation. No local
+// persistence call here — the sidecar writes the message into its
+// SessionManager's conversationHistory the moment chat/send fires
+// (see handleUserMessageAndRespond). banya-cli just mirrors what will
+// already be on disk within milliseconds.
 func (m *Model) addUserMessage(content string) {
 	m.messages = append(m.messages, protocol.Message{
 		ID:        uuid.New().String(),
@@ -354,7 +476,10 @@ func (m *Model) addSystemMessage(content string) {
 
 // finalizeAssistantMessage converts the streaming buffer into a message.
 // The stored content has <think>…</think> blocks collapsed, so re-rendering
-// history stays tidy.
+// history stays tidy. Local persistence is NOT our job anymore — the
+// sidecar's SessionManager already appended the user + assistant turn
+// to the current session's NDJSON on disk. banya-cli just keeps a view
+// cache that matches.
 func (m *Model) finalizeAssistantMessage() {
 	if m.streamContent != "" {
 		m.messages = append(m.messages, protocol.Message{

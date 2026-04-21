@@ -11,6 +11,7 @@ package commands
 import (
 	"sort"
 	"strings"
+	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/cascadecodes/banya-cli/internal/client"
@@ -41,6 +42,38 @@ type Context struct {
 	// endpoint without restart. Returns an error if the preset is
 	// unknown or its API-key env var is empty.
 	ApplyLLMPreset func(presetID string) error
+
+	// ListSessions returns saved conversations for the current workdir,
+	// most recent first. Returns an empty slice (never nil) when nothing
+	// is saved or the session dir is unreadable. Powers `/sessions`.
+	ListSessions func() []SessionInfo
+
+	// LoadSession switches the Model's in-memory conversation to the
+	// saved session with the given ID. Pass an empty ID to start a
+	// fresh session (same as `/new`). Returns an error when the ID
+	// isn't found. Powers `/load`.
+	LoadSession func(id string) error
+
+	// SaveCurrentAndStartNew persists the active conversation, then
+	// rolls to a brand-new session id with empty history. Powers
+	// `/new`.
+	SaveCurrentAndStartNew func() string
+}
+
+// SessionInfo is the command-layer projection of an on-disk session
+// — enough to render a picker without leaking the session package's
+// full shape.
+type SessionInfo struct {
+	ID        string
+	UpdatedAt time.Time
+	WorkDir   string
+	// Preview is a short excerpt of the first user message, handy for
+	// identifying sessions in the /sessions list.
+	Preview string
+	// MessageCount is the total message count (user + assistant + system).
+	MessageCount int
+	// Current flags the session that's currently loaded in the Model.
+	Current bool
 }
 
 // Result describes what the UI should show after a command runs.

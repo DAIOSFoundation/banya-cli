@@ -29,6 +29,15 @@ func (m Model) runSlashCommand(line string) (tea.Model, tea.Cmd) {
 		ApplyLLMPreset: func(id string) error {
 			return (&m).ApplyLLMPreset(id)
 		},
+		ListSessions: func() []commands.SessionInfo {
+			return (&m).listSessions()
+		},
+		LoadSession: func(id string) error {
+			return (&m).loadSession(id)
+		},
+		SaveCurrentAndStartNew: func() string {
+			return (&m).saveCurrentAndStartNew()
+		},
 	}
 	res := m.commands.Dispatch(line, ctx)
 

@@ -64,6 +64,20 @@ func (m *MockClient) Close() error {
 	return nil
 }
 
+// Session RPC stubs for tests — return empty lists so Model startup
+// resume paths don't error out in teatest harnesses.
+func (m *MockClient) ListSessions() ([]protocol.SessionSummary, error) {
+	return nil, nil
+}
+
+func (m *MockClient) LoadSession(id string) ([]protocol.Message, error) {
+	return nil, nil
+}
+
+func (m *MockClient) DeleteSession(id string) (bool, error) {
+	return false, nil
+}
+
 var errUnhealthy = &unhealthyError{}
 
 type unhealthyError struct{}

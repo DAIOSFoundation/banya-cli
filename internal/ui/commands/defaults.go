@@ -44,13 +44,32 @@ func (r *Registry) registerDefaults() {
 	})
 	r.Register(&Command{
 		Name:    "new",
-		Summary: "Start a fresh session (new session_id, clear history)",
-		Handler: func(_ Context, _ []string) Result {
+		Summary: "Save the current conversation, then start a fresh session",
+		Handler: func(ctx Context, _ []string) Result {
+			if ctx.SaveCurrentAndStartNew == nil {
+				// No session manager wired — legacy behaviour: just
+				// clear and mint a new id.
+				return Result{Clear: true, Output: "new session: " + uuid.New().String()}
+			}
+			newID := ctx.SaveCurrentAndStartNew()
 			return Result{
 				Clear:  true,
-				Output: "new session: " + uuid.New().String(),
+				Output: "saved previous conversation · new session: " + newID,
 			}
 		},
+	})
+	r.Register(&Command{
+		Name:    "sessions",
+		Aliases: []string{"ls-sessions"},
+		Usage:   "/sessions",
+		Summary: "List saved conversations for this workspace (most recent first)",
+		Handler: sessionsHandler,
+	})
+	r.Register(&Command{
+		Name:    "load",
+		Usage:   "/load <session-id|index>",
+		Summary: "Load a saved conversation by id (full UUID or 1-based index from /sessions)",
+		Handler: loadSessionHandler,
 	})
 	r.Register(&Command{
 		Name:    "config",
@@ -392,4 +411,76 @@ func orDefault(s, def string) string {
 		return def
 	}
 	return s
+}
+
+// sessionsHandler powers `/sessions`. Lists saved conversations for
+// the current workspace, most recent first, with a 1-based index that
+// `/load <index>` accepts. Empty state and missing-callback errors
+// fall through to helpful messages rather than noisy stack traces.
+func sessionsHandler(ctx Context, _ []string) Result {
+	if ctx.ListSessions == nil {
+		return Result{Output: "session manager not wired in this client"}
+	}
+	sessions := ctx.ListSessions()
+	if len(sessions) == 0 {
+		return Result{Output: "no saved sessions in this workspace yet · start chatting and one will be saved automatically"}
+	}
+	var b strings.Builder
+	b.WriteString("Saved sessions (use `/load <n>` or `/load <uuid>`):\n")
+	for i, s := range sessions {
+		marker := "  "
+		if s.Current {
+			marker = "* "
+		}
+		when := s.UpdatedAt.Local().Format("2006-01-02 15:04")
+		preview := s.Preview
+		if preview == "" {
+			preview = "(no user message yet)"
+		}
+		if len(preview) > 60 {
+			preview = preview[:57] + "…"
+		}
+		fmt.Fprintf(&b, "%s%d. %s · %s · %d msgs\n     %s\n",
+			marker, i+1, shortUUID(s.ID), when, s.MessageCount, preview)
+	}
+	return Result{Output: strings.TrimRight(b.String(), "\n")}
+}
+
+// loadSessionHandler powers `/load <id|index>`. Accepts either a full
+// UUID or a 1-based index matching `/sessions`. Anything else falls
+// through with a usage hint.
+func loadSessionHandler(ctx Context, args []string) Result {
+	if len(args) == 0 {
+		return Result{Output: "usage: /load <session-id|index>  (see /sessions for the list)"}
+	}
+	if ctx.LoadSession == nil || ctx.ListSessions == nil {
+		return Result{Output: "session manager not wired in this client"}
+	}
+	arg := strings.TrimSpace(args[0])
+	var targetID string
+	// Try index first: 1-based into the ListSessions slice.
+	if idx, err := parsePresetIndex(arg); err == nil {
+		sessions := ctx.ListSessions()
+		if idx < 0 || idx >= len(sessions) {
+			return Result{Output: fmt.Sprintf(
+				"index %s out of range — /sessions has %d entries", arg, len(sessions),
+			)}
+		}
+		targetID = sessions[idx].ID
+	} else {
+		targetID = arg
+	}
+	if err := ctx.LoadSession(targetID); err != nil {
+		return Result{Output: "load failed: " + err.Error()}
+	}
+	return Result{Output: "loaded session " + shortUUID(targetID)}
+}
+
+// shortUUID trims a UUID to its first 8 chars for compact display.
+// Falls back to the full string when it's shorter than 8 chars.
+func shortUUID(id string) string {
+	if len(id) < 8 {
+		return id
+	}
+	return id[:8]
 }

@@ -156,6 +156,22 @@ func (c *HTTPClient) Close() error {
 	return nil
 }
 
+// ListSessions / LoadSession / DeleteSession stubs for the remote
+// transport — the HTTP protocol doesn't carry session CRUD today.
+// TUIs running in remote mode fall back to "no saved sessions" until
+// the server exposes equivalents.
+func (c *HTTPClient) ListSessions() ([]protocol.SessionSummary, error) {
+	return nil, nil
+}
+
+func (c *HTTPClient) LoadSession(id string) ([]protocol.Message, error) {
+	return nil, nil
+}
+
+func (c *HTTPClient) DeleteSession(id string) (bool, error) {
+	return false, nil
+}
+
 func (c *HTTPClient) setHeaders(req *http.Request) {
 	req.Header.Set("Content-Type", "application/json")
 	if c.apiKey != "" {

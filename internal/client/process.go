@@ -443,6 +443,59 @@ func (c *ProcessClient) SendMessage(req protocol.ChatRequest) (<-chan protocol.S
 	return c.events, nil
 }
 
+// ListSessions fetches saved-conversation metadata from the sidecar.
+func (c *ProcessClient) ListSessions() ([]protocol.SessionSummary, error) {
+	resp, err := c.call(protocol.MethodSessionList, nil, 5*time.Second)
+	if err != nil {
+		return nil, err
+	}
+	raw, err := json.Marshal(resp.Result)
+	if err != nil {
+		return nil, fmt.Errorf("marshal session.list result: %w", err)
+	}
+	var parsed protocol.SessionListResult
+	if err := json.Unmarshal(raw, &parsed); err != nil {
+		return nil, fmt.Errorf("unmarshal session.list: %w", err)
+	}
+	return parsed.Sessions, nil
+}
+
+// LoadSession pulls the conversation history for the given id.
+func (c *ProcessClient) LoadSession(id string) ([]protocol.Message, error) {
+	params := protocol.SessionLoadParams{SessionID: id}
+	resp, err := c.call(protocol.MethodSessionLoad, params, 10*time.Second)
+	if err != nil {
+		return nil, err
+	}
+	raw, err := json.Marshal(resp.Result)
+	if err != nil {
+		return nil, fmt.Errorf("marshal session.load result: %w", err)
+	}
+	var parsed protocol.SessionLoadResult
+	if err := json.Unmarshal(raw, &parsed); err != nil {
+		return nil, fmt.Errorf("unmarshal session.load: %w", err)
+	}
+	return parsed.Messages, nil
+}
+
+// DeleteSession asks the sidecar to forget the given conversation.
+func (c *ProcessClient) DeleteSession(id string) (bool, error) {
+	params := protocol.SessionDeleteParams{SessionID: id}
+	resp, err := c.call("session.delete", params, 5*time.Second)
+	if err != nil {
+		return false, err
+	}
+	raw, err := json.Marshal(resp.Result)
+	if err != nil {
+		return false, fmt.Errorf("marshal session.delete result: %w", err)
+	}
+	var parsed protocol.SessionDeleteResult
+	if err := json.Unmarshal(raw, &parsed); err != nil {
+		return false, fmt.Errorf("unmarshal session.delete: %w", err)
+	}
+	return parsed.Deleted, nil
+}
+
 // SendApproval forwards the user's approval to the sidecar.
 func (c *ProcessClient) SendApproval(resp protocol.ApprovalResponse) error {
 	_, err := c.call(protocol.MethodApprovalRespond, resp, 10*time.Second)

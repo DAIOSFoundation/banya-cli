@@ -108,9 +108,56 @@ func (b *ClaudeCliBackend) Chat(
 		// want the final text.
 		"--permission-mode", "bypassPermissions",
 		"--model", b.model,
-		// Forbid every built-in tool so Claude responds with text only.
-		// banya-core owns file I/O and command execution.
-		"--disallowedTools", "Edit,Write,Bash,Read,Glob,Grep,WebFetch,WebSearch,NotebookEdit",
+		// Forbid every built-in Claude Code tool so Claude responds
+		// with text only — banya-core owns file I/O and command
+		// execution via its own XML envelope. The list grew with
+		// Claude Code 2.x which added a large set of side-channel
+		// tools (Agent, Skill, Monitor, TodoWrite, Worktree, Cron,
+		// ScheduleWakeup, …). Left unblocked, Claude sees them as
+		// "my real tools", ignores banya-core's envelope
+		// instructions, and refuses the user's request on the
+		// grounds that read_file / update_file / run_command
+		// "aren't registered". Keeping the block list exhaustive is
+		// cheaper than trying to whitelist — `--allowedTools ""`
+		// isn't supported and whitelisting a smaller set would leak
+		// future tools on every Claude Code upgrade.
+		"--disallowedTools",
+		strings.Join([]string{
+			// file + shell
+			"Edit", "Write", "Bash", "Read", "Glob", "Grep",
+			"WebFetch", "WebSearch", "NotebookEdit",
+			// agent / task orchestration
+			"Agent", "Skill", "ToolSearch", "Monitor",
+			"TodoWrite", "TaskStop", "TaskOutput",
+			"AskUserQuestion",
+			// plan / worktree / cron / wake scheduling
+			"EnterPlanMode", "ExitPlanMode",
+			"EnterWorktree", "ExitWorktree",
+			"CronCreate", "CronDelete", "CronList",
+			"ScheduleWakeup", "PushNotification", "RemoteTrigger",
+			// Block every MCP connector namespace. The user's Claude
+			// Code install may have globally-enabled MCP servers
+			// (Gmail / Calendar / Drive / Playwright / Stitch / …)
+			// whose tools follow the `mcp__<server>__<tool>` naming
+			// convention. If we leave those visible, Claude sees
+			// only them, decides banya-core's XML envelope `read_file`
+			// / `update_file` / `run_command` "aren't real tools",
+			// and refuses the user's request. Wildcard per server
+			// (`mcp__<server>__*`) wasn't reliable across Claude CLI
+			// versions, so we list the common connectors explicitly
+			// and add catch-all prefixes for futureproofing.
+			"mcp__claude_ai_Gmail__authenticate",
+			"mcp__claude_ai_Gmail__complete_authentication",
+			"mcp__claude_ai_Google_Calendar__authenticate",
+			"mcp__claude_ai_Google_Calendar__complete_authentication",
+			"mcp__claude_ai_Google_Drive__authenticate",
+			"mcp__claude_ai_Google_Drive__complete_authentication",
+			"mcp__playwright",
+			"mcp__stitch",
+			"mcp__context7",
+			"mcp__sequentialthinking",
+			"mcp__mcp-installer",
+		}, ","),
 		// Guard against a background build-up of cache/session files —
 		// each Chat() is a fresh one-shot.
 		"--setting-sources", "",
