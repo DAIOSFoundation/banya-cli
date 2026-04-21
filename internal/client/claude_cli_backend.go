@@ -107,6 +107,17 @@ func (b *ClaudeCliBackend) Chat(
 
 	cmd := exec.CommandContext(ctx, b.binary, args...)
 	cmd.Env = os.Environ()
+	// Disconnect stdin — claude -p reads its prompt from argv, not stdin,
+	// but without this claude inherits the parent process's stdin. In TUI
+	// mode that parent is Bubble Tea's raw-mode terminal; claude then sees
+	// the terminal escape sequences Bubble Tea writes to its own stdin
+	// and occasionally errors out on the unexpected bytes. Passing
+	// os.DevNull also matches how we invoke claude from the critic path.
+	devnull, err := os.Open(os.DevNull)
+	if err == nil {
+		cmd.Stdin = devnull
+		defer devnull.Close()
+	}
 
 	start := time.Now()
 	out, err := cmd.Output()
