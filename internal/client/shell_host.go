@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"runtime"
+	"strings"
 	"time"
 
 	"github.com/cascadecodes/banya-cli/pkg/protocol"
@@ -112,6 +114,21 @@ func NewLocalShellBackend(shell string) *LocalShellBackend {
 
 // Run implements ShellBackend.
 func (b *LocalShellBackend) Run(ctx context.Context, params protocol.ShellRunParams) (protocol.ShellRunResult, error) {
+	// Route GUI / long-running / interactive commands to a fresh
+	// Terminal.app window so pygame/tkinter/dev-server etc. actually
+	// display and the user can Ctrl-C them independently. The agent
+	// receives an immediate "spawned" response so it doesn't wait on
+	// stdout that would never arrive.
+	if shouldSpawnInTerminal(params.Command) {
+		return b.spawnInNewTerminal(ctx, params)
+	}
+	return b.runInProcess(ctx, params)
+}
+
+// runInProcess is the historical path: spawn via $SHELL -c, capture
+// stdout/stderr, return the result synchronously. Suitable for
+// git/grep/pip/ls and any command where the agent needs the output.
+func (b *LocalShellBackend) runInProcess(ctx context.Context, params protocol.ShellRunParams) (protocol.ShellRunResult, error) {
 	start := time.Now()
 
 	cmd := exec.CommandContext(ctx, b.shell, "-c", params.Command)
@@ -154,4 +171,101 @@ func (b *LocalShellBackend) Run(ctx context.Context, params protocol.ShellRunPar
 		return res, fmt.Errorf("shell exec: %w", runErr)
 	}
 	return res, nil
+}
+
+// spawnInNewTerminal opens a fresh Terminal.app window on macOS and
+// runs the command there. Returns immediately once the window is
+// scheduled; the agent never sees the subprocess's stdout because the
+// command now belongs to the user's interactive terminal, not the
+// agent's captured pipe. Linux/Windows fall back to runInProcess —
+// those platforms can add their own spawner (x-terminal-emulator,
+// wt/cmd start) when we need them.
+func (b *LocalShellBackend) spawnInNewTerminal(ctx context.Context, params protocol.ShellRunParams) (protocol.ShellRunResult, error) {
+	if runtime.GOOS != "darwin" {
+		// Outside macOS we don't have a universal "open a terminal
+		// window" primitive yet — fall back to in-process so the
+		// command at least executes, even if the GUI-window case
+		// doesn't work as the user expected.
+		return b.runInProcess(ctx, params)
+	}
+	start := time.Now()
+	// Build the shell snippet that the new Terminal window runs:
+	//   cd <cwd> && <user command>
+	// so the launched shell inherits the caller's working directory
+	// without needing an absolute path in every user command.
+	cwd := params.Cwd
+	if cwd == "" {
+		if d, err := os.Getwd(); err == nil {
+			cwd = d
+		}
+	}
+	inner := params.Command
+	if cwd != "" {
+		inner = "cd " + osaQuote(cwd) + " && " + inner
+	}
+	script := fmt.Sprintf(
+		`tell application "Terminal" to do script %s
+tell application "Terminal" to activate`,
+		osaQuote(inner),
+	)
+	cmd := exec.CommandContext(ctx, "osascript", "-e", script)
+	if err := cmd.Run(); err != nil {
+		// Osascript failed — fall back so the user still sees *some*
+		// output rather than a silent no-op.
+		return b.runInProcess(ctx, params)
+	}
+	return protocol.ShellRunResult{
+		ExitCode:  0,
+		Stdout:    "[spawned in new Terminal.app window: " + params.Command + "]",
+		ElapsedMs: time.Since(start).Milliseconds(),
+	}, nil
+}
+
+// shouldSpawnInTerminal decides whether a command is "GUI-ish" enough
+// to deserve its own Terminal.app window. Kept deliberately narrow so
+// routine tool calls (git status, ls, grep, pip install, pytest) stay
+// in-process and the agent keeps getting their output. Opt-in for
+// anyone: prefix the command with `!term ` to force the new-terminal
+// path regardless of shape.
+func shouldSpawnInTerminal(command string) bool {
+	trimmed := strings.TrimSpace(command)
+	lower := strings.ToLower(trimmed)
+	if strings.HasPrefix(lower, "!term ") || strings.HasPrefix(lower, "!terminal ") {
+		return true
+	}
+	// macOS `open` launches an app/URL — always a foreground UX.
+	if strings.HasPrefix(lower, "open ") {
+		return true
+	}
+	// Dev servers that want a live console: `npm run dev`, `npm start`,
+	// `yarn dev`, `pnpm dev`, `bun dev`, `cargo run`, `./gradlew bootRun`,
+	// `flutter run`.
+	for _, prefix := range []string{
+		"npm run dev", "npm start", "yarn dev", "yarn start",
+		"pnpm dev", "pnpm start", "bun dev", "bun run dev",
+		"cargo run", "flutter run", "./gradlew bootrun",
+	} {
+		if strings.HasPrefix(lower, prefix) {
+			return true
+		}
+	}
+	// Python scripts invoked as `python <file>.py` or `python3 …` are
+	// often pygame / tkinter GUIs. `python -c "..."`, `python -m pip`,
+	// etc. stay in-process because they're short-lived / CLI.
+	if (strings.HasPrefix(lower, "python ") || strings.HasPrefix(lower, "python3 ")) &&
+		strings.Contains(lower, ".py") &&
+		!strings.Contains(lower, " -c ") &&
+		!strings.Contains(lower, " -m pip") {
+		return true
+	}
+	return false
+}
+
+// osaQuote escapes a Go string for safe embedding inside an osascript
+// string literal. AppleScript uses double quotes and backslash-escapes
+// double quotes and backslashes.
+func osaQuote(s string) string {
+	s = strings.ReplaceAll(s, `\`, `\\`)
+	s = strings.ReplaceAll(s, `"`, `\"`)
+	return `"` + s + `"`
 }

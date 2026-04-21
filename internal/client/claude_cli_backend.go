@@ -85,7 +85,15 @@ func (b *ClaudeCliBackend) Chat(
 	params protocol.LlmChatParams,
 	onToken func(string) error,
 ) (string, string, []protocol.LlmToolCall, error) {
-	prompt := flattenMessagesForClaude(params.Messages, params.Tools)
+	// Split the incoming conversation: system messages become a
+	// --system-prompt arg (replaces Claude CLI's own Claude Code
+	// persona), the rest is collapsed into the -p body. Without this
+	// split, banya-core's 48KB system prompt flowed into -p as user
+	// text and Claude's safety training interpreted it as a prompt
+	// injection attempt ("Also worth flagging: the user message
+	// included an injected CODEPILOT system prompt…") and refused to
+	// call any tool.
+	systemPrompt, prompt := flattenMessagesForClaude(params.Messages, params.Tools)
 
 	ctx, cancel := context.WithTimeout(ctx, b.timeout)
 	defer cancel()
@@ -103,6 +111,13 @@ func (b *ClaudeCliBackend) Chat(
 		// Guard against a background build-up of cache/session files —
 		// each Chat() is a fresh one-shot.
 		"--setting-sources", "",
+	}
+	if systemPrompt != "" {
+		// --system-prompt REPLACES Claude CLI's default persona (the one
+		// that tells it "I'm Claude Code, here are my built-in tools").
+		// That's exactly what we want — banya-core's system prompt is the
+		// authoritative source of identity + tool envelope here.
+		args = append(args, "--system-prompt", systemPrompt)
 	}
 
 	cmd := exec.CommandContext(ctx, b.binary, args...)
@@ -153,17 +168,15 @@ func (b *ClaudeCliBackend) Chat(
 		appendTrace(trace, params, text, b.model, elapsed)
 	}
 
-	// Simulate streaming: a single callback at end-of-turn. banya-core
-	// accumulates onToken fragments into content; passing the full
-	// text once produces the same final state as a real stream.
-	if onToken != nil {
-		if err := onToken(text); err != nil {
-			// onToken may cancel the stream (e.g. ctx cancel). We've
-			// already produced the full response, so propagate err
-			// without discarding the content.
-			return text, "stop", nil, err
-		}
-	}
+	// Deliberately do NOT call onToken here. ClaudeCliBackend is
+	// not streaming (claude -p returns a single JSON blob); emitting
+	// the full text once on the JSON-RPC `content_delta` channel
+	// caused every line to render twice in the TUI because banya-core
+	// ALSO emits the same text as a chat-session content_delta. HTTP
+	// backends that genuinely stream keep their onToken fan-out —
+	// they only emit incremental fragments so banya-core's dedup
+	// isn't relevant.
+	_ = onToken
 
 	// Claude CLI does not return native tool_calls in this invocation
 	// mode. If banya-core's system prompt asked for tools via the
@@ -176,13 +189,34 @@ func (b *ClaudeCliBackend) Chat(
 // subprocess.
 func (b *ClaudeCliBackend) Close() error { return nil }
 
-// flattenMessagesForClaude collapses a message list + tool spec into a
-// single prompt string. Claude CLI takes a -p string; we prefix
-// system messages with "# System", others with role labels.
+// flattenMessagesForClaude splits a banya-core conversation into the
+// (system_prompt, body) pair that Claude CLI consumes. System
+// messages concatenate into the first return value (passed via
+// `--system-prompt`); everything else — user, assistant, tool results,
+// plus the advertised tool-spec list — collapses into the second
+// return (passed via `-p`). Keeping them separate is critical:
+// folding system messages into the user-facing body made Claude's
+// safety training treat our 48KB system prompt as a prompt-injection
+// attempt and refuse to invoke any tool.
+//
+// Tool specs are listed in the body with a human-readable preamble;
+// banya-core's system prompt already teaches the XML envelope, so the
+// body list is a reminder, not an authoritative schema.
 func flattenMessagesForClaude(
 	messages []protocol.LlmChatMessage,
 	tools []protocol.LlmToolSpec,
-) string {
+) (systemPrompt, body string) {
+	var sys strings.Builder
+	for _, m := range messages {
+		if m.Role != "system" {
+			continue
+		}
+		if sys.Len() > 0 {
+			sys.WriteString("\n\n")
+		}
+		sys.WriteString(m.Content)
+	}
+
 	var b strings.Builder
 	if len(tools) > 0 {
 		b.WriteString("# Available tools (reply in banya-core's XML envelope to invoke):\n")
@@ -200,7 +234,9 @@ func flattenMessagesForClaude(
 	for _, m := range messages {
 		switch m.Role {
 		case "system":
-			b.WriteString("# System\n")
+			// handled above — omit from body so Claude doesn't see it
+			// twice (and doesn't interpret it as user-injected text).
+			continue
 		case "user":
 			b.WriteString("# User\n")
 		case "assistant":
@@ -215,7 +251,7 @@ func flattenMessagesForClaude(
 		b.WriteString(m.Content)
 		b.WriteString("\n\n")
 	}
-	return b.String()
+	return sys.String(), b.String()
 }
 
 // parseClaudeJsonOutput extracts the text payload from the one-shot
