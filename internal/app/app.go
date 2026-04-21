@@ -127,6 +127,13 @@ func buildClient(cfg *config.Config, apiKey string) (client.Client, error) {
 				redirectProcessStderrToFile(w)
 			}
 		}
+		// Delegate run_command tool execution to the user's shell so
+		// commands see the same PATH / HOME / OAuth tokens / SSH keys
+		// the user has in their terminal. Only registered for the TUI —
+		// banya run leaves this nil and banya-core falls back to its
+		// internal LocalIde exec, preserving historical headless/codegen/
+		// benchmark behaviour.
+		pc.SetShellBackend(client.NewLocalShellBackend(""))
 		// Propagate Subagent config (critic 모델 등) through env so
 		// banya-core 가 자동 bootstrap. /settings 로 값이 바뀌면 현재
 		// 프로세스는 그대로, 다음 CLI 시작 시 적용.

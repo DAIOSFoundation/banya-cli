@@ -35,6 +35,12 @@ type ProcessClient struct {
 	// harnesses) leave this nil so stderr flows through the terminal
 	// next to the NDJSON stdout — matching prior behaviour.
 	stderrSink io.Writer
+	// shell, when non-nil, handles the sidecar's `shell.run` host RPC —
+	// i.e. the agent's run_command tool is delegated to the host so the
+	// command runs in the user's shell/cwd/env. Only set by TUI callers
+	// that want that pass-through semantics; headless callers leave it
+	// nil and banya-core falls back to its internal LocalIde exec.
+	shell ShellBackend
 
 	mu     sync.Mutex
 	cmd    *exec.Cmd
@@ -280,6 +286,8 @@ func (c *ProcessClient) handleHostRequest(req protocol.SidecarLine) {
 		c.handleLlmChat(req)
 	case protocol.MethodLlmCancel:
 		c.handleLlmCancel(req)
+	case protocol.MethodShellRun:
+		c.handleShellRun(req)
 	default:
 		c.writeResponse(req.ID, nil, &protocol.ErrorData{
 			Code:    "method_not_implemented",

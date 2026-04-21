@@ -28,7 +28,37 @@ const (
 const (
 	MethodLlmChat   = "llm.chat"
 	MethodLlmCancel = "llm.cancel"
+	// shell.run lets banya-core delegate the run_command tool to the
+	// host, so commands execute in the user's shell/cwd/env instead of
+	// the sidecar's subprocess. Only used when banya-cli registers a
+	// shell backend (interactive TUI mode). Headless callers keep the
+	// historical LocalIde in-process exec path.
+	MethodShellRun = "shell.run"
 )
+
+// ShellRunParams is the payload banya-core sends on `shell.run`.
+type ShellRunParams struct {
+	// Command is the full shell command string to execute. The host
+	// passes it to /bin/sh -c (or the user's configured shell) verbatim.
+	Command string `json:"command"`
+	// Cwd is an absolute path. Empty means "use the banya-cli process's
+	// cwd", i.e. whatever directory the user launched banya from.
+	Cwd string `json:"cwd,omitempty"`
+	// TimeoutMs hard-caps the exec time. 0 = use a sensible default (60s).
+	TimeoutMs int `json:"timeout_ms,omitempty"`
+}
+
+// ShellRunResult is the final response the host returns for `shell.run`.
+type ShellRunResult struct {
+	ExitCode  int    `json:"exit_code"`
+	Stdout    string `json:"stdout"`
+	Stderr    string `json:"stderr"`
+	ElapsedMs int64  `json:"elapsed_ms"`
+	// TimedOut is true when the exec was killed by the host's timeout
+	// guard rather than exiting on its own. banya-core can surface this
+	// to the agent so it knows to shorten the command or chunk output.
+	TimedOut bool `json:"timed_out,omitempty"`
+}
 
 // LlmChatParams is the payload the sidecar sends on `llm.chat`.
 type LlmChatParams struct {
