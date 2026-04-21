@@ -22,6 +22,7 @@ type LLMPreset struct {
 	// Description is a short sentence explaining the trade-off.
 	Description string
 	// URL is the OpenAI-compatible endpoint banya-core talks to.
+	// Empty for non-HTTP backends (e.g. claude-cli spawns a subprocess).
 	URL string
 	// Model is the model id passed as `model` in chat/completions bodies.
 	Model string
@@ -30,7 +31,16 @@ type LLMPreset struct {
 	TargetPort string
 	// APIKeyEnv names the env var that should supply the API key. We
 	// don't bake keys into the preset — the user must export it.
+	// Empty when the backend doesn't need an API key (CLI subprocess
+	// backends authenticate via their own mechanism, e.g. `claude login`
+	// OAuth for claude-cli).
 	APIKeyEnv string
+	// BackendID selects the registry factory (internal/client/backends_init.go).
+	// Empty = use the historical llm-server HTTP client. Set to "claude-cli",
+	// "gemini", "gemini-native", etc. to route through a different adapter.
+	// When non-empty AND URL is empty, the backend is treated as a subprocess
+	// provider: the API-key gate in ApplyLLMPreset is skipped.
+	BackendID string
 	// Beta marks presets whose transport is experimental (e.g. Anthropic's
 	// OpenAI-compat endpoint). The UI should show a hint.
 	Beta bool
@@ -63,6 +73,14 @@ var LLMPresets = []LLMPreset{
 		Model:       "claude-opus-4-7",
 		APIKeyEnv:   "ANTHROPIC_API_KEY",
 		Beta:        true,
+	},
+	{
+		ID:          "claude-cli",
+		Label:       "Claude Opus via Claude CLI (MAX plan, no API key)",
+		Description: "Spawns the local `claude -p` subprocess. Uses Claude MAX OAuth (run `claude login` once). No ANTHROPIC_API_KEY required; zero per-token billing.",
+		BackendID:   "claude-cli",
+		Model:       "opus",
+		// No URL, no APIKeyEnv — subprocess backend.
 	},
 }
 

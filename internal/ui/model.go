@@ -181,17 +181,39 @@ func (m *Model) ApplyLLMPreset(presetID string) error {
 		return fmt.Errorf("unknown preset: %s", presetID)
 	}
 	resolved := p.Resolve()
-	if resolved.APIKey == "" {
+	// API key gate applies only to HTTP presets (those that declared an
+	// APIKeyEnv). Subprocess backends like claude-cli authenticate via
+	// their own mechanism (OAuth) and must be allowed through with no key.
+	if p.APIKeyEnv != "" && resolved.APIKey == "" {
 		return fmt.Errorf(
 			"preset %s requires env var %s to be set (API key)",
 			p.ID, p.APIKeyEnv,
 		)
 	}
 	// Swap the backend on the process client if we're in sidecar mode.
+	// BackendID non-empty → go through the shared factory registry (covers
+	// claude-cli, gemini-native, and any future subprocess / REST adapter).
+	// Otherwise fall back to the historical llm-server HTTP client.
 	if pc, ok := m.client.(*client.ProcessClient); ok {
-		pc.SetLLMBackend(client.NewLLMServerClientWithTarget(
-			resolved.URL, resolved.APIKey, resolved.Model, resolved.TargetPort,
-		))
+		var backend client.LLMBackend
+		if p.BackendID != "" {
+			be, err := client.NewBackendFromConfig(client.BackendConfig{
+				Provider:   p.BackendID,
+				Endpoint:   resolved.URL,
+				APIKey:     resolved.APIKey,
+				Model:      resolved.Model,
+				TargetPort: resolved.TargetPort,
+			})
+			if err != nil {
+				return fmt.Errorf("build backend %s: %w", p.BackendID, err)
+			}
+			backend = be
+		} else {
+			backend = client.NewLLMServerClientWithTarget(
+				resolved.URL, resolved.APIKey, resolved.Model, resolved.TargetPort,
+			)
+		}
+		pc.SetLLMBackend(backend)
 	}
 	if err := config.SaveLLMServer(resolved); err != nil {
 		return fmt.Errorf("save config: %w", err)
