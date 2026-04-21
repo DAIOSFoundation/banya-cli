@@ -105,6 +105,17 @@ func buildClient(cfg *config.Config, apiKey string) (client.Client, error) {
 		// banya-core 가 자동 bootstrap. /settings 로 값이 바뀌면 현재
 		// 프로세스는 그대로, 다음 CLI 시작 시 적용.
 		env := client.SubagentEnvVars(cfg.Subagent.Provider, cfg.Subagent.Model, cfg.Subagent.APIKey, cfg.Subagent.Endpoint)
+		// TUI opts into interactive runtime mode — banya-core's
+		// ConversationManager skips QueryComposer (whose output would
+		// otherwise stream onto the chat screen) and ContextGatherer
+		// skips RepoMap (saves multi-second latency in large cwds).
+		// `banya run` (headless path) leaves this env unset so codegen
+		// and benchmark harnesses keep the full context pipeline.
+		// Caller-supplied BANYA_RUNTIME_MODE wins so power users can
+		// force headless behaviour in the TUI for debugging.
+		if os.Getenv("BANYA_RUNTIME_MODE") == "" {
+			env = append(env, "BANYA_RUNTIME_MODE=interactive")
+		}
 		if v := client.LanguageEnvVar(cfg.Language); v != "" {
 			env = append(env, v)
 		}
