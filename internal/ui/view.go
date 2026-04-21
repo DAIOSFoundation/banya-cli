@@ -37,8 +37,21 @@ func (m Model) View() string {
 		headerHeight := 1
 		inputHeight := 3 // 2-line prompt + 1
 		helpHeight := 1
-		bannerHeight := m.height - headerHeight - inputHeight - helpHeight - 2
+		hintHeight := 0
+		if m.resumedTurns > 0 {
+			hintHeight = 1
+		}
+		bannerHeight := m.height - headerHeight - inputHeight - helpHeight - hintHeight - 2
 		sections = append(sections, renderBanner(m.width, bannerHeight, m.bannerLines, m.taglineChars))
+		if m.resumedTurns > 0 {
+			hint := lipgloss.NewStyle().
+				Foreground(lipgloss.Color("#008B8B")).
+				Italic(true).
+				Width(m.width).
+				Align(lipgloss.Center).
+				Render(fmt.Sprintf("↺ 이전 세션 이어감 (%d턴 기억 중)", m.resumedTurns))
+			sections = append(sections, hint)
+		}
 	} else {
 		sections = append(sections, m.viewport.View())
 	}

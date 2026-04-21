@@ -114,6 +114,12 @@ type Model struct {
 	tickerEmoji       string
 	tickerWord        string
 	creativeTickCount int
+
+	// Count of conversation turns silently carried over from a resumed
+	// session. The TUI chat view stays empty (banner + fresh feeling),
+	// but banya-core's SessionManager still owns the full history that
+	// the LLM will see on the next chat.start. Zero when starting fresh.
+	resumedTurns int
 }
 
 // New creates a new TUI model.
@@ -163,32 +169,24 @@ func New(apiClient client.Client, cfg *config.Config) Model {
 	return m
 }
 
-// tryResumeLatestSession asks the sidecar for saved sessions,
-// filters to this workdir, and adopts the most recent one. Bound to
-// the sidecar's session_id so subsequent chat.start turns let
-// banya-core's ConversationManager pull the real conversation
-// history into the LLM context. No local mirror here — UI messages
-// and sidecar history share one source of truth.
+// tryResumeLatestSession silently binds the newest session for this
+// workdir so banya-core's SessionManager keeps feeding its
+// conversationHistory into the next chat.start's LLM context. The
+// TUI chat view stays empty — the banner renders as usual and users
+// get a clean startup. Explicit `/load <id>` still pulls the full
+// history into view; only the auto-resume-on-startup path is quiet.
+// Silent on any RPC failure (empty list, sidecar not ready, etc.).
 func (m *Model) tryResumeLatestSession() {
 	sessions, err := m.client.ListSessions()
 	if err != nil || len(sessions) == 0 {
 		return
 	}
-	// ListSessions is already sorted newest-first on the sidecar; we
-	// just walk it, picking the first cwd match.
 	for _, s := range sessions {
 		if s.WorkDir != "" && s.WorkDir != m.workDir {
 			continue
 		}
-		msgs, err := m.client.LoadSession(s.SessionID)
-		if err != nil {
-			continue
-		}
 		m.sessionID = s.SessionID
-		m.messages = append(make([]protocol.Message, 0, len(msgs)), msgs...)
-		if len(m.messages) > 0 {
-			m.showBanner = false
-		}
+		m.resumedTurns = s.MessageCount
 		return
 	}
 }
