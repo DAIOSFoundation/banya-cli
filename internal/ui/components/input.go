@@ -105,6 +105,14 @@ func (m *InputModel) Reset() {
 	m.textarea.Reset()
 }
 
+// SetValue replaces the textarea content and positions the cursor at
+// the end. Used by slash-command autocomplete to expand a partial
+// "/mo" into "/model ".
+func (m *InputModel) SetValue(v string) {
+	m.textarea.SetValue(v)
+	m.textarea.CursorEnd()
+}
+
 // SetWidth updates the textarea width.
 func (m *InputModel) SetWidth(width int) {
 	m.textarea.SetWidth(width - 6) // account for " ⚡❯ "

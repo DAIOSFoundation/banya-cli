@@ -86,6 +86,12 @@ type Model struct {
 
 	// Settings screen (StateSettings). Nil when not active.
 	settings *components.SettingsModel
+
+	// Slash-command autocomplete dropdown. The menu is stateless aside
+	// from the selected row index — item list is recomputed from the
+	// input on every render. slashSelected stays sticky across keystrokes
+	// so Up/Down feels consistent even as the filter changes.
+	slashSelected int
 }
 
 // New creates a new TUI model.

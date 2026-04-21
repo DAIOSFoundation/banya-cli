@@ -217,6 +217,70 @@ func (m Model) handleKeyPress(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, cmd
 	}
 
+	// Slash-command menu key interception. Only fires in StateReady and
+	// only when the input currently has an open menu (starts with '/' and
+	// the user hasn't typed a space yet). Tab/Up/Down/Esc are handled
+	// here so they don't leak into the textarea.
+	if m.state == StateReady {
+		menuItems := components.FilterSlashCommands(m.input.Value(), m.commands.All())
+		if len(menuItems) > 0 {
+			switch msg.String() {
+			case "up", "ctrl+p":
+				if m.slashSelected > 0 {
+					m.slashSelected--
+				} else {
+					m.slashSelected = len(menuItems) - 1
+				}
+				return m, nil
+			case "down", "ctrl+n":
+				if m.slashSelected < len(menuItems)-1 {
+					m.slashSelected++
+				} else {
+					m.slashSelected = 0
+				}
+				return m, nil
+			case "tab":
+				if m.slashSelected >= len(menuItems) {
+					m.slashSelected = 0
+				}
+				pick := menuItems[m.slashSelected]
+				m.input.SetValue("/" + pick.Name + " ")
+				m.slashSelected = 0
+				return m, nil
+			case "enter":
+				// Run the currently selected command with no args. The
+				// menu is only visible when there's no space in the
+				// input, so any partial name typed so far is replaced
+				// by the selection. Commands that need args (e.g. /model
+				// <id>) will print a usage hint when invoked with none —
+				// that's the right affordance: user can then re-type with
+				// the hint visible.
+				if m.slashSelected >= len(menuItems) {
+					m.slashSelected = 0
+				}
+				pick := menuItems[m.slashSelected]
+				m.input.Reset()
+				m.slashSelected = 0
+				return m.runSlashCommand("/" + pick.Name)
+			case "esc":
+				// Clear only the leading '/' partial so the menu hides
+				// without nuking any arg the user might have typed — but
+				// since the menu is only open when there's no space yet,
+				// we can safely reset the whole input.
+				m.input.Reset()
+				m.slashSelected = 0
+				return m, nil
+			}
+			// Clamp selection if the user's keystroke shrank the match
+			// set (typed a letter that narrowed the filter).
+			if m.slashSelected >= len(menuItems) {
+				m.slashSelected = len(menuItems) - 1
+			}
+		} else {
+			m.slashSelected = 0
+		}
+	}
+
 	switch msg.String() {
 	case "ctrl+c", "ctrl+d":
 		return m, tea.Quit

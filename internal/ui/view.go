@@ -5,6 +5,8 @@ import (
 	"strings"
 
 	"github.com/charmbracelet/lipgloss"
+
+	"github.com/cascadecodes/banya-cli/internal/ui/components"
 )
 
 // Powerline-style separator. Standard Unicode glyph so it renders in any
@@ -50,6 +52,18 @@ func (m Model) View() string {
 	if m.lastError != "" {
 		errMsg := m.theme.Error.Render(fmt.Sprintf(" Error: %s", m.lastError))
 		sections = append(sections, errMsg)
+	}
+
+	// Slash-command menu (only in StateReady, only when input currently
+	// qualifies for autocomplete — see FilterSlashCommands). Rendered
+	// just above the input so users see the dropdown cascading toward
+	// where they're typing. Empty items → empty string → joined as a
+	// no-op line by JoinVertical.
+	if m.state == StateReady {
+		items := components.FilterSlashCommands(m.input.Value(), m.commands.All())
+		if menu := components.RenderSlashMenu(items, m.slashSelected, m.width, 8); menu != "" {
+			sections = append(sections, menu)
+		}
 	}
 
 	// Input area or state indicator
