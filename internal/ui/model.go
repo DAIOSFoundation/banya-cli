@@ -92,6 +92,19 @@ type Model struct {
 	// input on every render. slashSelected stays sticky across keystrokes
 	// so Up/Down feels consistent even as the filter changes.
 	slashSelected int
+
+	// Creative ticker — the "thinking with emoji + word" animation that
+	// runs between the user's message and the streaming response.
+	// Fields update every ~600ms while in StateStreaming via
+	// creativeTickMsg; last-used word/emoji are tracked inside the
+	// ticker so two consecutive frames never repeat.
+	// creativeTickCount drives the periodic tea.ClearScreen safety
+	// repaint (every N ticks) that works around terminals whose
+	// alt-screen diff doesn't fully clear between frames.
+	creativeTicker    *creativeTickerState
+	tickerEmoji       string
+	tickerWord        string
+	creativeTickCount int
 }
 
 // New creates a new TUI model.
@@ -121,7 +134,8 @@ func New(apiClient client.Client, cfg *config.Config) Model {
 		taglineChars: -1,
 		debugBuf:     newDebugBuffer(),
 		debugHeight:  defaultDebugPanelHeight,
-		promptMode:   resolvePromptMode(cfg.PromptMode),
+		promptMode:     resolvePromptMode(cfg.PromptMode),
+		creativeTicker: newCreativeTicker(),
 	}
 	m.initStatusFromConfig()
 	return m

@@ -2,6 +2,7 @@ package commands
 
 import (
 	"fmt"
+	"os"
 	"runtime"
 	"strings"
 
@@ -132,6 +133,69 @@ func (r *Registry) registerDefaults() {
 		Summary: "Show or switch the main LLM preset (qwen | gemini | claude-opus)",
 		Handler: modelHandler,
 	})
+	r.Register(&Command{
+		Name:    "key",
+		Aliases: []string{"apikey"},
+		Usage:   "/key [preset-id] <value>  or  /key [preset-id] --clear",
+		Summary: "Save / clear the API key for an LLM preset (persisted in ~/.config/banya/keys.json, 0600)",
+		Handler: keyHandler,
+	})
+}
+
+// keyHandler saves an API key for an LLM preset into keys.json (mode
+// 0600 under the config dir). With one arg, the key is stored for the
+// CURRENTLY-SELECTED preset; with two args the first is the preset ID.
+// Pass `--clear` in place of the value to delete the entry.
+//
+// env var shadowing: the subsequent Resolve() still prefers
+// os.Getenv(APIKeyEnv) over the stored file, so an explicit `export`
+// in the shell trumps anything the user typed here. That matches
+// 12-factor habit and keeps the TUI from silently using a stale key
+// when the operator has re-exported a new one.
+func keyHandler(ctx Context, args []string) Result {
+	if len(args) == 0 {
+		return Result{Output: "usage: /key [preset-id] <value>  or  /key [preset-id] --clear\n" +
+			"Without <preset-id> the current preset is used."}
+	}
+
+	var presetID, value string
+	if len(args) == 1 {
+		current := config.MatchPresetFromConfig(ctx.Config.LLMServer)
+		if current == nil {
+			return Result{Output: "No preset currently selected — run `/model <id>` first, then `/key <value>`."}
+		}
+		presetID = current.ID
+		value = args[0]
+	} else {
+		presetID = strings.ToLower(args[0])
+		value = args[1]
+	}
+
+	p := config.LookupPreset(presetID)
+	if p == nil {
+		return Result{Output: "unknown preset: " + presetID + "  (try /model to list)"}
+	}
+	if p.APIKeyEnv == "" {
+		return Result{Output: "preset " + presetID + " doesn't use an API key (" + p.Label + ")"}
+	}
+
+	if value == "--clear" || value == "-c" {
+		if err := config.SaveLLMKey(presetID, ""); err != nil {
+			return Result{Output: "failed to clear key: " + err.Error()}
+		}
+		return Result{Output: "cleared stored key for " + presetID + " (env " + p.APIKeyEnv + " still wins if exported)"}
+	}
+
+	if err := config.SaveLLMKey(presetID, value); err != nil {
+		return Result{Output: "failed to save key: " + err.Error()}
+	}
+
+	envShadow := ""
+	if v := os.Getenv(p.APIKeyEnv); v != "" {
+		envShadow = "\n(note: env var " + p.APIKeyEnv + " is set — it will still override the stored key)"
+	}
+	return Result{Output: "saved " + presetID + " API key to ~/.config/banya/keys.json (0600)" + envShadow +
+		"\nRun `/model " + presetID + "` to switch the main LLM to this preset."}
 }
 
 func modelHandler(ctx Context, args []string) Result {

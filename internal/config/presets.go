@@ -11,8 +11,6 @@
 // advanced users can still edit ~/.config/banya/config.yaml by hand.
 package config
 
-import "os"
-
 // LLMPreset describes one selectable main-model option.
 type LLMPreset struct {
 	// ID is the stable handle the user types: `/model qwen`, `/model gemini`.
@@ -107,12 +105,14 @@ func MatchPresetFromConfig(c LLMServerConfig) *LLMPreset {
 }
 
 // Resolve expands the preset into a concrete LLMServerConfig, pulling
-// the API key from the named env var. An empty key is returned without
-// error — callers should warn the user to export the variable.
+// the API key in priority order: env var (preset.APIKeyEnv) first,
+// then the persisted keys.json entry set via the TUI's `/key` command.
+// An empty key is returned without error — callers should warn the
+// user to export the variable or run `/key <value>`.
 func (p LLMPreset) Resolve() LLMServerConfig {
 	return LLMServerConfig{
 		URL:        p.URL,
-		APIKey:     os.Getenv(p.APIKeyEnv),
+		APIKey:     ResolveLLMKey(&p),
 		Model:      p.Model,
 		TargetPort: p.TargetPort,
 	}

@@ -113,18 +113,26 @@ func buildClient(cfg *config.Config, apiKey string) (client.Client, error) {
 			return nil, err
 		}
 		pc.SetLLMBackend(backend)
-		// Sidecar stderr would otherwise tear the Bubble Tea screen — it's
-		// the path banya-core uses for console.log, Bun SEA boot probes,
-		// LLM manager traces, etc. Route to a dated log file under the
-		// user-scoped data dir, AND redirect our own os.Stderr FD there so
-		// any `fmt.Fprintf(os.Stderr, ...)` in banya-cli (e.g. the
-		// "[banya-cli] unparseable sidecar line" warning) lands in the same
-		// file instead of tearing the TUI. BANYA_SIDECAR_STDERR=inherit
-		// restores the legacy behaviour (both streams flow to the terminal).
+		// Sidecar stderr goes to a dated log file under the user-scoped
+		// data dir so banya-core's console.log / Bun SEA boot probes /
+		// LLM manager traces don't tear the Bubble Tea screen.
+		// BANYA_SIDECAR_STDERR=inherit restores legacy
+		// inherit-terminal behaviour for crash debugging.
+		//
+		// We deliberately do NOT reassign os.Stderr on the banya-cli
+		// side. Bubble Tea's termenv probes the terminal over stderr
+		// for capability detection (colour support, alt-screen); when
+		// fd 2 was pointing at a log file the probe's reply never came
+		// back and termenv downgraded to a renderer that emitted
+		// every frame as a fresh stdout line — visible on macOS
+		// Terminal as the screen scrolling one row per tick. Keeping
+		// os.Stderr on the real terminal preserves alt-screen. The
+		// rare `[banya-cli] unparseable sidecar line` warning does
+		// hit stderr, but it's a one-shot single line when it
+		// happens, not a scroll-ruining flood.
 		if os.Getenv("BANYA_SIDECAR_STDERR") != "inherit" {
 			if w := openSidecarLog(); w != nil {
 				pc.SetStderrSink(w)
-				redirectProcessStderrToFile(w)
 			}
 		}
 		// Delegate run_command tool execution to the user's shell so

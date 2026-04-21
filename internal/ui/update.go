@@ -3,6 +3,7 @@ package ui
 import (
 	"github.com/charmbracelet/bubbles/spinner"
 	tea "github.com/charmbracelet/bubbletea"
+
 	"github.com/cascadecodes/banya-cli/internal/client"
 	"github.com/cascadecodes/banya-cli/internal/ui/commands"
 	"github.com/cascadecodes/banya-cli/internal/ui/components"
@@ -178,6 +179,27 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			cmds = append(cmds, thinkTick())
 		}
 		m.updateViewportContent()
+
+	case creativeTickMsg:
+		// Advance the ticker and schedule the next tick only while we're
+		// still streaming. On state transition back to Ready the ticker
+		// naturally halts — no explicit stop needed.
+		if m.state == StateStreaming && m.creativeTicker != nil {
+			m.tickerEmoji, m.tickerWord = m.creativeTicker.Next()
+			m.creativeTickCount++
+			cmds = append(cmds, creativeTick())
+			m.updateViewportContent()
+			// Periodic belt-and-suspenders: every ~3 seconds during
+			// streaming, ask Bubble Tea to wipe the screen and redraw
+			// from scratch. Works around terminals whose alt-screen
+			// diff misses trailing artifacts when content height
+			// fluctuates (observed on macOS Terminal with rapid
+			// multi-line viewport churn). Cheap in practice — one
+			// full repaint ≈ few KB of escape codes.
+			if m.creativeTickCount%5 == 0 {
+				cmds = append(cmds, tea.ClearScreen)
+			}
+		}
 	}
 
 	// Update sub-components
@@ -309,9 +331,14 @@ func (m Model) handleKeyPress(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.toolCalls = nil
 			m.lastError = ""
 			m.thinkingFrame = 0
+			// Seed the creative ticker so the animation has something
+			// to paint on the first render before the first tick fires.
+			if m.creativeTicker != nil {
+				m.tickerEmoji, m.tickerWord = m.creativeTicker.Next()
+			}
 			m.debugBuf.push("USER", content)
 			m.updateViewportContent()
-			return m, tea.Batch(m.sendMessage(content), thinkTick())
+			return m, tea.Batch(m.sendMessage(content), thinkTick(), creativeTick())
 		}
 		if m.state == StateApproval && m.pendingApproval != nil {
 			toolCallID := m.pendingApproval.ToolCallID
@@ -435,6 +462,15 @@ func (m Model) handleApprovalResult(msg ApprovalResultMsg) (tea.Model, tea.Cmd) 
 // updateViewportContent refreshes the viewport with current state.
 func (m *Model) updateViewportContent() {
 	content := m.chatView.RenderMessages(m.messages)
+
+	// Creative ticker sits between the last message and the streaming
+	// response — "사용자 명령 바로 아래" per the original UX ask. The
+	// line is padded to m.width and a trailing newline added so the
+	// diff-based terminal renderer fully overwrites any wider previous
+	// frame, eliminating character ghosts when emoji widths differ.
+	if m.state == StateStreaming && m.tickerEmoji != "" && m.tickerWord != "" {
+		content += "\n" + padRight(renderCreativeTicker(m.tickerEmoji, m.tickerWord), m.width) + "\n"
+	}
 
 	if m.streamContent != "" {
 		content += m.chatView.RenderStreamingContent(

@@ -214,51 +214,103 @@ tell application "Terminal" to activate`,
 		// output rather than a silent no-op.
 		return b.runInProcess(ctx, params)
 	}
+	// Directive result so the agent doesn't retry the command thinking
+	// it failed. We explicitly tell the model: (a) the spawn succeeded,
+	// (b) no stdout/stderr will be captured because the command owns
+	// its own Terminal.app window now, (c) it must NOT call
+	// run_command again for the same task. Without this the agent sees
+	// a short stdout, assumes the program failed to run, and retries
+	// 2-3× (seen live: three pygame windows popped up back to back).
+	msg := "✓ Successfully launched in a new Terminal.app window.\n" +
+		"Command: " + params.Command + "\n" +
+		"Working directory: " + cwd + "\n\n" +
+		"The command is now running in the user's interactive terminal. " +
+		"No stdout/stderr is captured back here — that's by design for " +
+		"GUI apps and long-running servers. TREAT THIS AS SUCCESS and " +
+		"MOVE ON. Do NOT call run_command again for the same thing; " +
+		"if the user later reports an error, ask them to describe it."
 	return protocol.ShellRunResult{
 		ExitCode:  0,
-		Stdout:    "[spawned in new Terminal.app window: " + params.Command + "]",
+		Stdout:    msg,
 		ElapsedMs: time.Since(start).Milliseconds(),
 	}, nil
 }
 
 // shouldSpawnInTerminal decides whether a command is "GUI-ish" enough
-// to deserve its own Terminal.app window. Kept deliberately narrow so
-// routine tool calls (git status, ls, grep, pip install, pytest) stay
-// in-process and the agent keeps getting their output. Opt-in for
-// anyone: prefix the command with `!term ` to force the new-terminal
-// path regardless of shape.
+// to deserve its own Terminal.app window. Uses Contains — not
+// HasPrefix — so chained commands like `cd foo && python3 app.py` and
+// `nohup python3 app.py > log 2>&1 &` still route correctly. Kept
+// deliberately narrow so routine tool calls (git status, ls, grep,
+// pip install, pytest) stay in-process and the agent keeps getting
+// their output. Opt-in for anyone: include `!term` / `!terminal`
+// anywhere in the command to force the new-terminal path.
 func shouldSpawnInTerminal(command string) bool {
 	trimmed := strings.TrimSpace(command)
 	lower := strings.ToLower(trimmed)
-	if strings.HasPrefix(lower, "!term ") || strings.HasPrefix(lower, "!terminal ") {
+	if strings.Contains(lower, "!term") || strings.Contains(lower, "!terminal") {
 		return true
 	}
-	// macOS `open` launches an app/URL — always a foreground UX.
-	if strings.HasPrefix(lower, "open ") {
+	// macOS `open <file|app>` launches a foreground UX. Token-bounded
+	// so substrings like "reopen" inside a sed script don't match.
+	if containsToken(lower, "open ") {
 		return true
 	}
-	// Dev servers that want a live console: `npm run dev`, `npm start`,
-	// `yarn dev`, `pnpm dev`, `bun dev`, `cargo run`, `./gradlew bootRun`,
-	// `flutter run`.
-	for _, prefix := range []string{
+	// Long-lived foreground processes — dev servers, interactive apps.
+	// Matched anywhere in the command so env prefixes / cd chains are
+	// caught: `BROWSER=none streamlit run app.py`, `cd src && npm run dev`.
+	for _, token := range []string{
 		"npm run dev", "npm start", "yarn dev", "yarn start",
 		"pnpm dev", "pnpm start", "bun dev", "bun run dev",
 		"cargo run", "flutter run", "./gradlew bootrun",
+		"streamlit run", "gradio", "uvicorn ", "fastapi dev",
+		"rails server", "rails s ", "./manage.py runserver",
+		"python manage.py runserver", "python3 manage.py runserver",
 	} {
-		if strings.HasPrefix(lower, prefix) {
+		if strings.Contains(lower, token) {
 			return true
 		}
 	}
-	// Python scripts invoked as `python <file>.py` or `python3 …` are
-	// often pygame / tkinter GUIs. `python -c "..."`, `python -m pip`,
-	// etc. stay in-process because they're short-lived / CLI.
-	if (strings.HasPrefix(lower, "python ") || strings.HasPrefix(lower, "python3 ")) &&
+	// Python script invocations — often pygame / tkinter GUIs or
+	// long-running servers. Covers `python main.py`, `python3 main.py`,
+	// `cd <dir> && python3 main.py`, `nohup python3 main.py &`. Rejects
+	// short-lived CLI forms: `python -c "..."`, `python -m pip`,
+	// `python -m py_compile`, pytest / unittest runners.
+	if (strings.Contains(lower, "python ") || strings.Contains(lower, "python3 ") ||
+		strings.Contains(lower, "python2 ")) &&
 		strings.Contains(lower, ".py") &&
 		!strings.Contains(lower, " -c ") &&
-		!strings.Contains(lower, " -m pip") {
+		!strings.Contains(lower, "-m pip") &&
+		!strings.Contains(lower, "-m py_compile") &&
+		!strings.Contains(lower, "-m pytest") &&
+		!strings.Contains(lower, "-m unittest") {
 		return true
 	}
 	return false
+}
+
+// containsToken reports whether `needle` appears at the start of
+// `haystack` OR immediately after a whitespace / shell-operator
+// boundary. Keeps substring checks from misfiring inside identifiers
+// (e.g. "reopen the file" should NOT match "open "). Caller must
+// provide `needle` lower-cased.
+func containsToken(haystack, needle string) bool {
+	idx := 0
+	for {
+		rel := strings.Index(haystack[idx:], needle)
+		if rel < 0 {
+			return false
+		}
+		abs := idx + rel
+		if abs == 0 {
+			return true
+		}
+		prev := haystack[abs-1]
+		switch prev {
+		case ' ', '\t', '\n', '&', ';', '|':
+			return true
+		}
+		idx = abs + len(needle)
+	}
 }
 
 // osaQuote escapes a Go string for safe embedding inside an osascript

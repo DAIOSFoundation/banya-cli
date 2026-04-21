@@ -47,10 +47,13 @@ const (
 	// who want `opus` set it via BANYA_MAIN_MODEL or BackendConfig.Model.
 	DefaultClaudeCliModel = "sonnet"
 
-	// DefaultClaudeCliTimeout — 5 min per turn. Long enough for a 128k
-	// context response, short enough that a hang doesn't block the
-	// benchmark's own turn budget.
-	DefaultClaudeCliTimeout = 5 * time.Minute
+	// DefaultClaudeCliTimeout — 10 min per turn. 5 min was enough for
+	// the first turn's clean response, but multi-turn TUI sessions with
+	// accumulating conversation history routinely push past that on the
+	// second / third agent-loop step (seen live: claude-cli (claude):
+	// signal: killed mid-response). 10 min handles a 128k context
+	// response comfortably while still bounding genuine hangs.
+	DefaultClaudeCliTimeout = 10 * time.Minute
 )
 
 type ClaudeCliBackend struct {
