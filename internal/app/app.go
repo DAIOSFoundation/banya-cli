@@ -81,7 +81,33 @@ func buildClient(cfg *config.Config, apiKey string) (client.Client, error) {
 	case "remote":
 		return client.NewHTTPClient(cfg.Server.URL, apiKey), nil
 	case "", "sidecar":
-		backend := client.NewLLMServerClientWithTarget(cfg.LLMServer.URL, cfg.LLMServer.APIKey, cfg.LLMServer.Model, cfg.LLMServer.TargetPort)
+		// Pick the backend based on the saved LLM config. If the URL+Model
+		// match a preset whose BackendID is set (e.g. claude-cli, which
+		// spawns `claude -p` instead of talking HTTP), route through the
+		// factory registry. Otherwise fall back to the historical
+		// OpenAI-compat HTTP client. Without this, the TUI always built
+		// an LLMServerClient at startup, and a persisted `claude-cli`
+		// preset would issue HTTP requests to llm-server with the wrong
+		// model id (seen in the wild as `404: The model opus does not
+		// exist`).
+		var backend client.LLMBackend
+		if matched := config.MatchPresetFromConfig(cfg.LLMServer); matched != nil && matched.BackendID != "" {
+			be, err := client.NewBackendFromConfig(client.BackendConfig{
+				Provider:   matched.BackendID,
+				Endpoint:   cfg.LLMServer.URL,
+				APIKey:     cfg.LLMServer.APIKey,
+				Model:      cfg.LLMServer.Model,
+				TargetPort: cfg.LLMServer.TargetPort,
+			})
+			if err != nil {
+				return nil, fmt.Errorf("build backend %s: %w", matched.BackendID, err)
+			}
+			backend = be
+		} else {
+			backend = client.NewLLMServerClientWithTarget(
+				cfg.LLMServer.URL, cfg.LLMServer.APIKey, cfg.LLMServer.Model, cfg.LLMServer.TargetPort,
+			)
+		}
 		pc, err := client.NewProcessClient(cfg.Sidecar.Path)
 		if err != nil {
 			return nil, err
