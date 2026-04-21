@@ -74,7 +74,14 @@ func (c *ChatView) RenderMessage(msg protocol.Message) string {
 // RenderMessages formats all messages in the conversation.
 func (c *ChatView) RenderMessages(messages []protocol.Message) string {
 	var b strings.Builder
-	separator := lipgloss.NewStyle().Foreground(lipgloss.Color("#00802a")).Render(strings.Repeat("─", c.width-2))
+	// c.width can be 0 during initial Bubble Tea layout (before the
+	// terminal size event fires) or 1 in degenerate PTYs. strings.Repeat
+	// panics on a negative count, so clamp first.
+	sepWidth := c.width - 2
+	if sepWidth < 1 {
+		sepWidth = 1
+	}
+	separator := lipgloss.NewStyle().Foreground(lipgloss.Color("#00802a")).Render(strings.Repeat("─", sepWidth))
 	for i, msg := range messages {
 		b.WriteString(c.RenderMessage(msg))
 		if i < len(messages)-1 {

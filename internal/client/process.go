@@ -28,6 +28,13 @@ type ProcessClient struct {
 	// Used to pass subagent / critic config (BANYA_SUBAGENT_*) through
 	// the /settings TUI without round-tripping through the IPC protocol.
 	extraEnv []string
+	// stderrSink, when non-nil, receives the sidecar's stderr stream
+	// instead of os.Stderr. TUI callers redirect to a log file to keep
+	// sidecar chatter (console.log, Bun SEA boot probes, etc.) from
+	// tearing the Bubble Tea screen. Headless callers (banya run, eval
+	// harnesses) leave this nil so stderr flows through the terminal
+	// next to the NDJSON stdout — matching prior behaviour.
+	stderrSink io.Writer
 
 	mu     sync.Mutex
 	cmd    *exec.Cmd
@@ -60,6 +67,17 @@ func (c *ProcessClient) SetExtraEnv(env []string) {
 		return
 	}
 	c.extraEnv = append([]string(nil), env...)
+}
+
+// SetStderrSink redirects the sidecar's stderr to `w`. Must be called
+// before the sidecar starts (the first Chat / request). Passing nil
+// restores the default (inherit os.Stderr). TUI callers point this at
+// a log file to keep sidecar chatter from tearing the Bubble Tea
+// screen; headless callers leave it unset.
+func (c *ProcessClient) SetStderrSink(w io.Writer) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.stderrSink = w
 }
 
 // SubagentEnvVars renders provider/model/apiKey/endpoint as KEY=VALUE
@@ -181,7 +199,11 @@ func (c *ProcessClient) start() error {
 		cancel()
 		return fmt.Errorf("stdout pipe: %w", err)
 	}
-	cmd.Stderr = os.Stderr
+	if c.stderrSink != nil {
+		cmd.Stderr = c.stderrSink
+	} else {
+		cmd.Stderr = os.Stderr
+	}
 
 	if err := cmd.Start(); err != nil {
 		cancel()

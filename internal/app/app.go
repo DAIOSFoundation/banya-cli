@@ -4,8 +4,11 @@ package app
 import (
 	"bufio"
 	"fmt"
+	"io"
 	"os"
+	"path/filepath"
 	"strings"
+	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/cascadecodes/banya-cli/internal/audio"
@@ -84,6 +87,20 @@ func buildClient(cfg *config.Config, apiKey string) (client.Client, error) {
 			return nil, err
 		}
 		pc.SetLLMBackend(backend)
+		// Sidecar stderr would otherwise tear the Bubble Tea screen — it's
+		// the path banya-core uses for console.log, Bun SEA boot probes,
+		// LLM manager traces, etc. Route to a dated log file under the
+		// user-scoped data dir, AND redirect our own os.Stderr FD there so
+		// any `fmt.Fprintf(os.Stderr, ...)` in banya-cli (e.g. the
+		// "[banya-cli] unparseable sidecar line" warning) lands in the same
+		// file instead of tearing the TUI. BANYA_SIDECAR_STDERR=inherit
+		// restores the legacy behaviour (both streams flow to the terminal).
+		if os.Getenv("BANYA_SIDECAR_STDERR") != "inherit" {
+			if w := openSidecarLog(); w != nil {
+				pc.SetStderrSink(w)
+				redirectProcessStderrToFile(w)
+			}
+		}
 		// Propagate Subagent config (critic 모델 등) through env so
 		// banya-core 가 자동 bootstrap. /settings 로 값이 바뀌면 현재
 		// 프로세스는 그대로, 다음 CLI 시작 시 적용.
@@ -98,6 +115,56 @@ func buildClient(cfg *config.Config, apiKey string) (client.Client, error) {
 	default:
 		return nil, fmt.Errorf("unknown mode %q (want sidecar|remote)", cfg.Mode)
 	}
+}
+
+// redirectProcessStderrToFile reassigns os.Stderr to the provided file
+// so any `fmt.Fprintf(os.Stderr, ...)` call in banya-cli (e.g. the
+// "[banya-cli] unparseable sidecar line" warning in process.go) lands
+// in the log file instead of tearing the Bubble Tea screen.
+//
+// We reassign the Go-level variable rather than dup'ing fd 2 at the
+// syscall layer because (1) the former is portable across darwin/linux/
+// windows without build-tag gymnastics, and (2) it covers every call
+// site that reads os.Stderr at invocation time. Runtime-level writes
+// to fd 2 (Go panic traces, C library diagnostics) still hit the
+// terminal, which is the right behaviour — a real panic should not be
+// hidden in a log file the user has to discover.
+//
+// Silent on non-*os.File writers (shouldn't happen today; guard for
+// future callers).
+func redirectProcessStderrToFile(w io.Writer) {
+	if f, ok := w.(*os.File); ok {
+		os.Stderr = f
+	}
+}
+
+// openSidecarLog returns a writer pointed at
+// $XDG_DATA_HOME/banya/logs/sidecar-YYYYMMDD-HHMMSS.log (or
+// ~/.local/share/banya/logs/… when XDG is unset). Returns nil on any
+// failure — the caller falls back to os.Stderr in that case so a
+// misconfigured filesystem can't break the TUI. Intentionally
+// best-effort: no rotation / retention — the file is overwritten each
+// invocation, which is fine because sidecar stderr is diagnostic,
+// not audit material.
+func openSidecarLog() io.Writer {
+	dir := os.Getenv("XDG_DATA_HOME")
+	if dir == "" {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return nil
+		}
+		dir = filepath.Join(home, ".local", "share")
+	}
+	logDir := filepath.Join(dir, "banya", "logs")
+	if err := os.MkdirAll(logDir, 0o755); err != nil {
+		return nil
+	}
+	name := fmt.Sprintf("sidecar-%s.log", time.Now().Format("20060102-150405"))
+	f, err := os.OpenFile(filepath.Join(logDir, name), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	if err != nil {
+		return nil
+	}
+	return f
 }
 
 
