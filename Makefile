@@ -12,7 +12,7 @@ EMBED_DIR := internal/client/embedded_sidecar
 
 # Resolve host platform sidecar name.
 HOST_OS := $(shell uname -s | tr '[:upper:]' '[:lower:]')
-HOST_ARCH := $(shell uname -m | sed 's/x86_64/amd64/')
+HOST_ARCH := $(shell uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/')
 HOST_SIDECAR := banya-core-$(HOST_OS)-$(HOST_ARCH)
 
 .PHONY: all build build-mock install clean test lint run dev help embed-sidecar
