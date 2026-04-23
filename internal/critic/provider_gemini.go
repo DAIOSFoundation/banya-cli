@@ -48,7 +48,12 @@ func (p *GeminiProvider) Review(ctx context.Context, args ReviewArgs) (string, e
 		},
 		"generationConfig": map[string]any{
 			"temperature":      0.2,
-			"maxOutputTokens":  4096,
+			// gemini-2.5-pro는 thinking 모드 상시 ON (thinkingBudget=0 거부됨)
+			// 이고 thinking 토큰이 maxOutputTokens 한도를 함께 소비한다.
+			// 4096으로는 복잡 패치 리뷰 시 thinking 이후 JSON 응답이 잘려
+			// `unexpected end of JSON input` 파싱 에러로 이어졌다. 32768로
+			// 올려 thinking(수백~수천 토큰) 이후에도 JSON 완결을 보장한다.
+			"maxOutputTokens":  32768,
 			"responseMimeType": "application/json",
 		},
 	}
