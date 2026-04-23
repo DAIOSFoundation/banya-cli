@@ -42,6 +42,9 @@ import (
 	"github.com/cascadecodes/banya-cli/pkg/protocol"
 )
 
+// maxRetries is the number of retries for recoverable errors (rate limit, 529 overloaded).
+const maxRetries = 3
+
 const (
 	// DefaultClaudeCliModel — `sonnet` is the common balance. Callers
 	// who want `opus` set it via BANYA_MAIN_MODEL or BackendConfig.Model.
@@ -101,6 +104,49 @@ func (b *ClaudeCliBackend) Chat(
 	ctx, cancel := context.WithTimeout(ctx, b.timeout)
 	defer cancel()
 
+	var (
+		text     string
+		parseErr error
+	)
+	for attempt := 0; attempt <= maxRetries; attempt++ {
+		text, parseErr = b.chatOnce(ctx, systemPrompt, prompt)
+		if parseErr == nil {
+			break
+		}
+		// Retry only on rate-limit (429) or overload (529).
+		if !isRetryableClaudeErr(parseErr) || attempt == maxRetries {
+			return "", "", nil, parseErr
+		}
+		backoff := time.Duration(60*(attempt+1)) * time.Second
+		fmt.Fprintf(os.Stderr, "[claude-cli] rate limit / overload on attempt %d — waiting %s before retry\n", attempt+1, backoff)
+		select {
+		case <-ctx.Done():
+			return "", "", nil, ctx.Err()
+		case <-time.After(backoff):
+		}
+	}
+	if trace := os.Getenv("BANYA_LLM_TRACE_PATH"); trace != "" {
+		appendTrace(trace, params, text, b.model, 0)
+	}
+	_ = onToken
+	return text, "stop", nil, nil
+}
+
+// isRetryableClaudeErr returns true if the error indicates a rate limit (429)
+// or API overload (529) that is worth retrying.
+func isRetryableClaudeErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := err.Error()
+	return strings.Contains(s, "api_error_status=429") ||
+		strings.Contains(s, "api_error_status=529") ||
+		strings.Contains(s, "rate limit") ||
+		strings.Contains(s, "overloaded")
+}
+
+// chatOnce executes a single claude -p subprocess call and returns the text response.
+func (b *ClaudeCliBackend) chatOnce(ctx context.Context, systemPrompt, prompt string) (string, error) {
 	args := []string{
 		"-p", prompt,
 		"--output-format", "json",
@@ -184,13 +230,8 @@ func (b *ClaudeCliBackend) Chat(
 		defer devnull.Close()
 	}
 
-	start := time.Now()
 	out, err := cmd.Output()
-	elapsed := time.Since(start)
 	if err != nil {
-		// Surface stderr tail — most Claude CLI failures are "not
-		// signed in" / quota / unknown model, and all of those are
-		// actionable only if the user sees the exact message.
 		stderr := ""
 		if ee, ok := err.(*exec.ExitError); ok {
 			stderr = string(ee.Stderr)
@@ -198,41 +239,28 @@ func (b *ClaudeCliBackend) Chat(
 				stderr = "…" + stderr[len(stderr)-800:]
 			}
 		}
-		return "", "", nil, fmt.Errorf(
-			"claude-cli (%s): %w; stderr: %s", b.binary, err, stderr,
-		)
+		// claude outputs errors as JSON to stdout even on non-zero exit.
+		// Parse it to surface api_error_status (429 = rate limit, 529 = overload).
+		if len(out) > 0 {
+			var obj map[string]any
+			if json.Unmarshal(out, &obj) == nil {
+				if status, ok := obj["api_error_status"]; ok {
+					result, _ := obj["result"].(string)
+					return "", fmt.Errorf(
+						"claude-cli (%s): %w; api_error_status=%v result=%q stderr: %s",
+						b.binary, err, status, result, stderr,
+					)
+				}
+			}
+		}
+		return "", fmt.Errorf("claude-cli (%s): %w; stderr: %s", b.binary, err, stderr)
 	}
 
 	text, parseErr := parseClaudeJsonOutput(out)
 	if parseErr != nil {
-		return "", "", nil, parseErr
+		return "", parseErr
 	}
-
-	// Optional trace: log the (messages, completion) pair for offline
-	// LoRA training. Claude's native XML tool envelope IS exactly what
-	// banya-core's ToolParser expects, so these raw I/O pairs are
-	// tokenisable directly as SFT data for a Qwen adapter that learns
-	// the same format. Set BANYA_LLM_TRACE_PATH to a directory to
-	// enable; silent no-op if unset.
-	if trace := os.Getenv("BANYA_LLM_TRACE_PATH"); trace != "" {
-		appendTrace(trace, params, text, b.model, elapsed)
-	}
-
-	// Deliberately do NOT call onToken here. ClaudeCliBackend is
-	// not streaming (claude -p returns a single JSON blob); emitting
-	// the full text once on the JSON-RPC `content_delta` channel
-	// caused every line to render twice in the TUI because banya-core
-	// ALSO emits the same text as a chat-session content_delta. HTTP
-	// backends that genuinely stream keep their onToken fan-out —
-	// they only emit incremental fragments so banya-core's dedup
-	// isn't relevant.
-	_ = onToken
-
-	// Claude CLI does not return native tool_calls in this invocation
-	// mode. If banya-core's system prompt asked for tools via the
-	// XML-style envelope, the text already contains them and
-	// ToolParser will extract them downstream.
-	return text, "stop", nil, nil
+	return text, nil
 }
 
 // Close — nothing to release; every Chat() spawns + reaps its own

@@ -124,7 +124,7 @@ func thresholdFor(tier string) PassThreshold {
 	case "low":
 		return PassThreshold{Total: 90, Correctness: 23, Completeness: 20, MaxSeverity: 0.55}
 	default: // high / medium / "" (legacy)
-		return PassThreshold{Total: 85, Correctness: 22, Completeness: 18, MaxSeverity: 0.6}
+		return PassThreshold{Total: 88, Correctness: 23, Completeness: 19, MaxSeverity: 0.6}
 	}
 }
 
