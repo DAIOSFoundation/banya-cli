@@ -12,8 +12,17 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"time"
 )
+
+// criticMaxOutputTokens — gemini-2.5-pro is thinking-mode-only and
+// thinking tokens share the maxOutputTokens budget with the visible
+// response. 4K caused complex patch reviews to drain the budget on
+// thinking and return finishReason=MAX_TOKENS with no candidate parts,
+// surfacing as "(critic empty response)" in critic.go. 32K leaves
+// room for both thinking and a full GapObject JSON payload.
+const criticMaxOutputTokens = 32768
 
 type GeminiProvider struct {
 	APIKey   string
@@ -48,12 +57,7 @@ func (p *GeminiProvider) Review(ctx context.Context, args ReviewArgs) (string, e
 		},
 		"generationConfig": map[string]any{
 			"temperature":      0.2,
-			// gemini-2.5-pro는 thinking 모드 상시 ON (thinkingBudget=0 거부됨)
-			// 이고 thinking 토큰이 maxOutputTokens 한도를 함께 소비한다.
-			// 4096으로는 복잡 패치 리뷰 시 thinking 이후 JSON 응답이 잘려
-			// `unexpected end of JSON input` 파싱 에러로 이어졌다. 32768로
-			// 올려 thinking(수백~수천 토큰) 이후에도 JSON 완결을 보장한다.
-			"maxOutputTokens":  32768,
+			"maxOutputTokens":  criticMaxOutputTokens,
 			"responseMimeType": "application/json",
 		},
 	}
@@ -83,12 +87,33 @@ func (p *GeminiProvider) Review(ctx context.Context, args ReviewArgs) (string, e
 					Text string `json:"text"`
 				} `json:"parts"`
 			} `json:"content"`
+			FinishReason string `json:"finishReason"`
 		} `json:"candidates"`
+		UsageMetadata struct {
+			PromptTokenCount     int `json:"promptTokenCount"`
+			CandidatesTokenCount int `json:"candidatesTokenCount"`
+			ThoughtsTokenCount   int `json:"thoughtsTokenCount"`
+			TotalTokenCount      int `json:"totalTokenCount"`
+		} `json:"usageMetadata"`
+		PromptFeedback json.RawMessage `json:"promptFeedback"`
 	}
 	if err := json.Unmarshal(raw, &apiResp); err != nil {
 		return "", fmt.Errorf("decode: %w", err)
 	}
 	if len(apiResp.Candidates) == 0 || len(apiResp.Candidates[0].Content.Parts) == 0 {
+		// Empty parts can happen for several reasons — finishReason and
+		// the thinking-vs-candidates token split are the load-bearing
+		// signals to distinguish them. Surface them on stderr so the
+		// sidecar log captures the cause instead of silently REVISE-ing.
+		fr := ""
+		if len(apiResp.Candidates) > 0 {
+			fr = apiResp.Candidates[0].FinishReason
+		}
+		um := apiResp.UsageMetadata
+		fmt.Fprintf(os.Stderr,
+			"[critic/gemini] empty response: finishReason=%q usage{prompt=%d candidates=%d thoughts=%d total=%d} promptFeedback=%s\n",
+			fr, um.PromptTokenCount, um.CandidatesTokenCount, um.ThoughtsTokenCount, um.TotalTokenCount,
+			truncate(string(apiResp.PromptFeedback), 200))
 		return "", nil
 	}
 	return apiResp.Candidates[0].Content.Parts[0].Text, nil
