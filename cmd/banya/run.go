@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -378,12 +379,24 @@ func runHeadless(cmd *cobra.Command, _ []string) error {
 	// mid-investigation (tools=3, fast), or they loop on read_file /
 	// ast_search until they hit the hard timeout (tools=24, 900s). Both
 	// modes walk away with zero points even when the critic could
-	// rescue a wrong patch. Send a single "commit now" continuation
-	// turn with a tighter budget so the agent can lock in ANY patch.
-	if !wbLayout.Active() && !noPatchNudge && !nudgedThisRun && exitCode != 3 && !patchExists() {
+	// rescue a wrong patch. Send up to `maxNudges` "commit now"
+	// continuation turns. Default 2 — one extra attempt covers the case
+	// where the first nudge also failed (often when the agent kept
+	// investigating instead of writing a patch).
+	maxNudges := 2
+	if v := os.Getenv("BANYA_MAX_NO_PATCH_NUDGES"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
+			maxNudges = n
+		}
+	}
+	nudgeAttempts := 0
+	for !wbLayout.Active() && !noPatchNudge && nudgeAttempts < maxNudges && exitCode != 3 && !patchExists() {
+		nudgeAttempts++
 		nudgedThisRun = true
 		emitMeta(out, map[string]any{
 			"phase":      "nudge",
+			"attempt":    nudgeAttempts,
+			"max":        maxNudges,
 			"prev_exit":  exitReason,
 			"session_id": sessionID,
 		})
@@ -404,17 +417,41 @@ func runHeadless(cmd *cobra.Command, _ []string) error {
 		reviewer := critic.NewFromEnv()
 		if reviewer != nil {
 			issueText, _ := readIssueForCritic(criticIssueFile, promptText)
+
+			// Ship-it escape hatch: when the agent's REVISE turn produces
+			// the same patch as the previous round, the loop is stuck.
+			// After `shipItAfterStalls` consecutive same-hash rounds we
+			// emit `phase=critic ok=true reason=ship_it_after_stall` so
+			// downstream classification treats the patch as approved.
+			// Default 2 — first stall lets the agent try once more; the
+			// hatch only fires when the agent demonstrably can't progress.
+			shipItAfterStalls := 2
+			if v := os.Getenv("BANYA_CRITIC_SHIPIT_AFTER_STALLS"); v != "" {
+				if n, err := strconv.Atoi(v); err == nil && n > 0 {
+					shipItAfterStalls = n
+				}
+			}
+
 			var lastPatchHash string
+			stalledRounds := 0
 			for round := 1; round <= criticMaxRounds; round++ {
 				patchBytes, _ := os.ReadFile(patchPath)
 				hash := fmt.Sprintf("%d-%d", len(patchBytes), hashBytes(patchBytes))
 				if round > 1 && hash == lastPatchHash {
-					emitMeta(out, map[string]any{
-						"phase":      "critic_revise_stuck",
-						"round":      round,
-						"session_id": sessionID,
-					})
-					break
+					stalledRounds++
+					if stalledRounds >= shipItAfterStalls {
+						emitMeta(out, map[string]any{
+							"phase":          "critic",
+							"round":          round,
+							"ok":             true,
+							"reason":         "ship_it_after_stall",
+							"stalled_rounds": stalledRounds,
+							"session_id":     sessionID,
+						})
+						break
+					}
+				} else {
+					stalledRounds = 0
 				}
 				lastPatchHash = hash
 
