@@ -112,6 +112,7 @@ Precedence (highest wins): CLI flags > env vars (`BANYA_*`) > `~/.config/banya/c
 | `BANYA_SKILL_INJECTION_MODE` | `lazy` (default) \| `eager` — inline skill bodies into the system prompt |
 | `BANYA_LLM_TRACE_PATH` | directory for per-turn JSONL traces (LoRA data collection) |
 | `BANYA_SIDECAR_STDERR` | `inherit` to pipe sidecar stderr to the terminal for debugging; default routes it to a log file so the TUI stays clean |
+| `BANYA_SWE_BENCH` | when `=1`, force temperature `0.1` / top_p `0.1` on the llm-server backend for deterministic code/diff generation. Used by the SWE-bench harness with on-prem Qwen3.5-122B. Pairs with banya-core's slim SWE-bench prompt (also gated by this flag). Full setup: `agent-evaluation/docs/qwen3.5-122b-SWE-setting.md` in the banya-framework parent repo. |
 
 ### Log files
 
