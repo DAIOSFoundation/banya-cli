@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -126,6 +128,7 @@ func NewLLMServerClientWithTarget(baseURL, apiKey, model, targetPort string) *LL
 // accumulated per-index across the stream and returned alongside the
 // content.
 func (c *LLMServerClient) Chat(ctx context.Context, params protocol.LlmChatParams, onToken func(string) error) (string, string, []protocol.LlmToolCall, error) {
+	traceStart := time.Now()
 	messages := make([]openaiMessage, 0, len(params.Messages))
 	for _, m := range params.Messages {
 		messages = append(messages, openaiMessage{Role: string(m.Role), Content: m.Content})
@@ -141,12 +144,24 @@ func (c *LLMServerClient) Chat(ctx context.Context, params protocol.LlmChatParam
 		model = params.Model
 	}
 
+	// SWE-bench preset (BANYA_SWE_BENCH=1) overrides sampling for
+	// deterministic-leaning output. Code/diff generation is much more
+	// reliable at low temperature; lower top_p further trims long-tail
+	// drift into analysis prose. Caller-provided params are ignored when
+	// the env flag is set so harness-side settings stay consistent across
+	// the run.
+	temperature := pickFloat(params.Temperature, 0.7)
+	topP := pickFloat(params.TopP, 0.95)
+	if os.Getenv("BANYA_SWE_BENCH") == "1" {
+		temperature = 0.1
+		topP = 0.1
+	}
 	reqBody := openaiChatRequest{
 		Model:       model,
 		Messages:    messages,
 		MaxTokens:   pickInt(params.MaxTokens, 2048),
-		Temperature: pickFloat(params.Temperature, 0.7),
-		TopP:        pickFloat(params.TopP, 0.95),
+		Temperature: temperature,
+		TopP:        topP,
 		Stream:      true,
 	}
 	if len(params.Tools) > 0 {
@@ -260,7 +275,66 @@ func (c *LLMServerClient) Chat(ctx context.Context, params protocol.LlmChatParam
 			break
 		}
 	}
-	return content.String(), finish, collectToolCalls(toolAcc), nil
+	finalContent := content.String()
+	finalTools := collectToolCalls(toolAcc)
+	if tracePath := os.Getenv("BANYA_LLM_TRACE_PATH"); tracePath != "" {
+		writeLLMServerTrace(tracePath, model, params, reqBody, finalContent, finish, finalTools, time.Since(traceStart))
+	}
+	return finalContent, finish, finalTools, nil
+}
+
+// writeLLMServerTrace dumps a raw request/response record for diagnostic
+// inspection. Captures the EXACT messages + tools + tool_choice we sent
+// plus the model's content/finish/tool_calls. Best-effort; never errors.
+func writeLLMServerTrace(
+	path, model string,
+	params protocol.LlmChatParams,
+	reqBody openaiChatRequest,
+	completion, finish string,
+	toolCalls []protocol.LlmToolCall,
+	elapsed time.Duration,
+) {
+	rec := map[string]any{
+		"timestamp":  time.Now().UTC().Format(time.RFC3339Nano),
+		"provider":   "llm-server",
+		"model":      model,
+		"elapsed_ms": elapsed.Milliseconds(),
+		"workspace":  currentWorkspace(),
+		"request": map[string]any{
+			"messages":     reqBody.Messages,
+			"tools":        reqBody.Tools,
+			"tool_choice":  reqBody.ToolChoice,
+			"max_tokens":   reqBody.MaxTokens,
+			"temperature":  reqBody.Temperature,
+			"top_p":        reqBody.TopP,
+			"params_tools": params.Tools,
+		},
+		"response": map[string]any{
+			"content":    completion,
+			"finish":     finish,
+			"tool_calls": toolCalls,
+		},
+	}
+	target := resolveTracePath(path)
+	if target == "" {
+		return
+	}
+	line, err := json.Marshal(rec)
+	if err != nil {
+		return
+	}
+	traceWriteMu.Lock()
+	defer traceWriteMu.Unlock()
+	if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+		return
+	}
+	f, err := os.OpenFile(target, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+	_, _ = f.Write(line)
+	_, _ = f.Write([]byte{'\n'})
 }
 
 // collectToolCalls emits the accumulated tool_call map in stable index
