@@ -156,13 +156,20 @@ func (c *LLMServerClient) Chat(ctx context.Context, params protocol.LlmChatParam
 		temperature = 0.1
 		topP = 0.1
 	}
+	// vLLM's `qwen3_coder` tool-call-parser fails to convert the model's
+	// native XML format (`<function=name><parameter=k>v</parameter></function>`)
+	// to native `tool_calls` when streaming under realistic SWE-bench loads
+	// (32 tools + 7K-char system prompt). Empirically the same payload
+	// non-streamed parses correctly. `BANYA_LLM_NO_STREAM=1` forces a single
+	// POST/JSON response so the parser sees the full output at once.
+	useNonStream := os.Getenv("BANYA_LLM_NO_STREAM") == "1"
 	reqBody := openaiChatRequest{
 		Model:       model,
 		Messages:    messages,
 		MaxTokens:   pickInt(params.MaxTokens, 2048),
 		Temperature: temperature,
 		TopP:        topP,
-		Stream:      true,
+		Stream:      !useNonStream,
 	}
 	if len(params.Tools) > 0 {
 		reqBody.Tools = make([]openaiTool, 0, len(params.Tools))
@@ -199,7 +206,9 @@ func (c *LLMServerClient) Chat(ctx context.Context, params protocol.LlmChatParam
 		return "", "", nil, fmt.Errorf("create request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Accept", "text/event-stream")
+	if !useNonStream {
+		req.Header.Set("Accept", "text/event-stream")
+	}
 	if c.apiKey != "" {
 		req.Header.Set("Authorization", "Bearer "+c.apiKey)
 	}
@@ -216,6 +225,74 @@ func (c *LLMServerClient) Chat(ctx context.Context, params protocol.LlmChatParam
 	if resp.StatusCode != http.StatusOK {
 		errBody, _ := io.ReadAll(resp.Body)
 		return "", "", nil, fmt.Errorf("llm-server %d: %s", resp.StatusCode, string(errBody))
+	}
+
+	// Non-streaming branch: single-shot JSON response. Used when vLLM's
+	// streaming tool-call parser is buggy for the active model (e.g.
+	// qwen3_coder).
+	if useNonStream {
+		bodyBytes, rerr := io.ReadAll(resp.Body)
+		if rerr != nil {
+			return "", "", nil, fmt.Errorf("read non-stream body: %w", rerr)
+		}
+		var nsResp struct {
+			Choices []struct {
+				FinishReason *string `json:"finish_reason"`
+				Message      struct {
+					Content   string                 `json:"content"`
+					ToolCalls []openaiStreamToolCall `json:"tool_calls,omitempty"`
+				} `json:"message"`
+			} `json:"choices"`
+		}
+		if err := json.Unmarshal(bodyBytes, &nsResp); err != nil {
+			return "", "", nil, fmt.Errorf("parse non-stream response: %w", err)
+		}
+		if len(nsResp.Choices) == 0 {
+			snippet := string(bodyBytes)
+			if len(snippet) > 200 {
+				snippet = snippet[:200]
+			}
+			return "", "", nil, fmt.Errorf("non-stream response: no choices in body=%s", snippet)
+		}
+		ch := nsResp.Choices[0]
+		finish := ""
+		if ch.FinishReason != nil {
+			finish = *ch.FinishReason
+		}
+		var toolCalls []protocol.LlmToolCall
+		for _, tc := range ch.Message.ToolCalls {
+			toolCalls = append(toolCalls, protocol.LlmToolCall{
+				ID:        tc.ID,
+				Name:      tc.Function.Name,
+				Arguments: tc.Function.Arguments,
+			})
+		}
+		// Fallback: vLLM's qwen3_coder tool-call-parser sometimes returns
+		// the model's raw XML in `content` with `tool_calls` empty under
+		// large-payload scenarios. Recover by parsing the XML here so
+		// banya-core sees the tool_calls regardless of vLLM behaviour.
+		if len(toolCalls) == 0 && ch.Message.Content != "" {
+			recovered := parseQwenXMLToolCalls(ch.Message.Content)
+			if len(recovered) > 0 {
+				toolCalls = recovered
+				// Strip the parsed XML from content so banya-core's
+				// fallback text parser doesn't double-count.
+				ch.Message.Content = ""
+				if finish == "stop" || finish == "" {
+					finish = "tool_calls"
+				}
+			}
+		}
+		// Mirror streaming behaviour: pipe content through onToken once.
+		if onToken != nil && ch.Message.Content != "" {
+			if cbErr := onToken(ch.Message.Content); cbErr != nil {
+				return ch.Message.Content, finish, toolCalls, cbErr
+			}
+		}
+		if tracePath := os.Getenv("BANYA_LLM_TRACE_PATH"); tracePath != "" {
+			writeLLMServerTrace(tracePath, model, params, reqBody, ch.Message.Content, finish, toolCalls, time.Since(traceStart))
+		}
+		return ch.Message.Content, finish, toolCalls, nil
 	}
 
 	var content strings.Builder

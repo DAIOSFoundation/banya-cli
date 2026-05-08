@@ -65,6 +65,8 @@ Intended for eval harnesses that drive the agent programmatically.`,
 	cmd.Flags().Duration("nudge-timeout", 300*time.Second, "Hard timeout for the nudge turn (shorter than the main timeout; nudge is commit-only work).")
 	cmd.Flags().Int("critic-max-rounds", 3, "Maximum number of critic→revise rounds. Stops early on critic OK or unchanged patch.")
 	cmd.Flags().Duration("thinking-abort", 300*time.Second, "Abort a turn when the agent goes this long between tool calls after the first one (catches thinking-only loops). 0 disables.")
+	cmd.Flags().Bool("swe-pytest-gate", false, "SWE-bench only: after critic OK, run the project's pytest file for the modified module. If it fails, treat as critic NOT-OK and trigger one revise round. Auto-enabled when BANYA_SWE_BENCH=1.")
+	cmd.Flags().Int("swe-pytest-timeout", 240, "Per-pytest-invocation timeout in seconds (default 240).")
 	return cmd
 }
 
@@ -113,6 +115,13 @@ func runHeadless(cmd *cobra.Command, _ []string) error {
 		criticMaxRounds = 1
 	}
 	thinkingAbort, _ := cmd.Flags().GetDuration("thinking-abort")
+	swePytestGate, _ := cmd.Flags().GetBool("swe-pytest-gate")
+	swePytestTimeout, _ := cmd.Flags().GetInt("swe-pytest-timeout")
+	// Auto-enable when SWE-bench mode env is set, so the harness doesn't need
+	// to add another flag to BANYA_CLI_EXTRA_ARGS.
+	if !swePytestGate && os.Getenv("BANYA_SWE_BENCH") == "1" {
+		swePytestGate = true
+	}
 
 	out := bufio.NewWriter(os.Stdout)
 	defer out.Flush()
@@ -437,6 +446,7 @@ func runHeadless(cmd *cobra.Command, _ []string) error {
 					"feedback":   decision.Feedback,
 					"session_id": sessionID,
 				})
+
 				if decision.OK {
 					break
 				}
@@ -467,6 +477,67 @@ func runHeadless(cmd *cobra.Command, _ []string) error {
 			"phase":  "critic_skip",
 			"reason": "no patch.diff (even after nudge)",
 		})
+	}
+
+	// SWE-bench post-critic pytest gate (authoritative).
+	//
+	// Runs AFTER the critic loop ends — regardless of how it ended (OK,
+	// reject, budget_exhausted, revise_stuck). The hidden test suite IS
+	// the project's pytest file, so passing pytest is the strongest
+	// alignment signal available. If pytest passes, accept the patch
+	// regardless of critic verdict; if it fails, do one final revise turn
+	// with the pytest output as feedback, then re-check pytest.
+	//
+	// Decision matrix:
+	//   pytest PASS                → ACCEPT (overrides critic reject/stuck)
+	//   pytest FAIL → revise → PASS → ACCEPT
+	//   pytest FAIL → revise → FAIL → fall through (critic verdict stands)
+	//   no test files / disabled    → no-op (critic decision stands)
+	if swePytestGate && !wbLayout.Active() && exitCode == 0 && patchExists() {
+		patchedFiles := extractPatchedFiles(patchPath)
+		pytestTestFiles := findTestFilesForModule(workDir, patchedFiles)
+		if len(pytestTestFiles) > 0 {
+			pCtx, pCancel := context.WithTimeout(cmd.Context(), time.Duration(swePytestTimeout)*time.Second)
+			pytestPassed, pytestFeedback := runProjectPytest(pCtx, workDir, pytestTestFiles, swePytestTimeout)
+			pCancel()
+			emitMeta(out, map[string]any{
+				"phase":          "swe_pytest_gate",
+				"stage":          "post_critic",
+				"passed":         pytestPassed,
+				"test_files":     pytestTestFiles,
+				"feedback_chars": len(pytestFeedback),
+				"session_id":     sessionID,
+			})
+			if !pytestPassed {
+				// One final revise turn with pytest feedback.
+				revisePrompt := buildPytestRevisePrompt(pytestTestFiles, pytestFeedback)
+				_, exitReason, exitCode = runOneTurn(out, pc, protocol.ChatRequest{
+					SessionID:  sessionID,
+					Message:    revisePrompt,
+					WorkDir:    workDir,
+					PromptType: protocol.PromptType(promptTypeStr),
+				}, timeout, idleAbort, thinkingAbort, autoApprove)
+				refreshPatchDiff(workDir, out)
+				if exitCode == 0 && patchExists() {
+					pCtx2, pCancel2 := context.WithTimeout(cmd.Context(), time.Duration(swePytestTimeout)*time.Second)
+					pytestPassed2, _ := runProjectPytest(pCtx2, workDir, pytestTestFiles, swePytestTimeout)
+					pCancel2()
+					emitMeta(out, map[string]any{
+						"phase":      "swe_pytest_gate",
+						"stage":      "post_revise",
+						"passed":     pytestPassed2,
+						"session_id": sessionID,
+					})
+				}
+			}
+		} else {
+			emitMeta(out, map[string]any{
+				"phase":         "swe_pytest_gate_skipped",
+				"reason":        "no test file found for patched modules",
+				"patched_files": patchedFiles,
+				"session_id":    sessionID,
+			})
+		}
 	}
 
 	emitMeta(out, map[string]any{
