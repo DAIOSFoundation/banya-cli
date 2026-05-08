@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -155,6 +156,22 @@ func (c *LLMServerClient) Chat(ctx context.Context, params protocol.LlmChatParam
 	if os.Getenv("BANYA_SWE_BENCH") == "1" {
 		temperature = 0.1
 		topP = 0.1
+	}
+	// BO@N override (Strategy b+): when banya-cli's runBoN sets
+	// BANYA_SWE_BO_TEMPERATURE / BANYA_SWE_BO_TOP_P per sample, those win
+	// over the SWE_BENCH=1 deterministic preset so each of the N samples
+	// gets its own point in the temperature/top_p grid for diversity. Env
+	// var presence is the signal — empty string means "not in BO@N", fall
+	// back to whatever was set above.
+	if v := os.Getenv("BANYA_SWE_BO_TEMPERATURE"); v != "" {
+		if t, err := strconv.ParseFloat(v, 64); err == nil && t > 0 {
+			temperature = t
+		}
+	}
+	if v := os.Getenv("BANYA_SWE_BO_TOP_P"); v != "" {
+		if p, err := strconv.ParseFloat(v, 64); err == nil && p > 0 {
+			topP = p
+		}
 	}
 	// vLLM's `qwen3_coder` tool-call-parser fails to convert the model's
 	// native XML format (`<function=name><parameter=k>v</parameter></function>`)

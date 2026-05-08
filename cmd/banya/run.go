@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -67,6 +68,10 @@ Intended for eval harnesses that drive the agent programmatically.`,
 	cmd.Flags().Duration("thinking-abort", 300*time.Second, "Abort a turn when the agent goes this long between tool calls after the first one (catches thinking-only loops). 0 disables.")
 	cmd.Flags().Bool("swe-pytest-gate", false, "SWE-bench only: after critic OK, run the project's pytest file for the modified module. If it fails, treat as critic NOT-OK and trigger one revise round. Auto-enabled when BANYA_SWE_BENCH=1.")
 	cmd.Flags().Int("swe-pytest-timeout", 240, "Per-pytest-invocation timeout in seconds (default 240).")
+	cmd.Flags().Int("swe-bo-n", 1, "SWE-bench Best-of-N sampling: when N>1, run N independent agent samples per task (each with its own temperature) and pick the best by hybrid verifier (pytest gate + critic). Default 1 = off. Recommended N=4 for testing, N=16 for paper-comparable.")
+	cmd.Flags().Float64("swe-bo-temp-min", 0.7, "BO@N: minimum temperature across samples (linear spread to --swe-bo-temp-max). Default 0.7.")
+	cmd.Flags().Float64("swe-bo-temp-max", 1.0, "BO@N: maximum temperature across samples. Default 1.0.")
+	cmd.Flags().Int("swe-bo-revise-rounds", 1, "BO@N per-sample revise budget: 0 = pure BO@N (no per-sample revise), 1 = b+ default (1 critic-revise + 1 pytest-revise per sample), 2+ = aggressive polishing per sample.")
 	return cmd
 }
 
@@ -121,6 +126,16 @@ func runHeadless(cmd *cobra.Command, _ []string) error {
 	// to add another flag to BANYA_CLI_EXTRA_ARGS.
 	if !swePytestGate && os.Getenv("BANYA_SWE_BENCH") == "1" {
 		swePytestGate = true
+	}
+	sweBoN, _ := cmd.Flags().GetInt("swe-bo-n")
+	sweBoTempMin, _ := cmd.Flags().GetFloat64("swe-bo-temp-min")
+	sweBoTempMax, _ := cmd.Flags().GetFloat64("swe-bo-temp-max")
+	sweBoReviseRounds, _ := cmd.Flags().GetInt("swe-bo-revise-rounds")
+	// Env override for harness convenience.
+	if envN := os.Getenv("BANYA_SWE_BO_N"); envN != "" {
+		if v, err := strconv.Atoi(envN); err == nil && v > sweBoN {
+			sweBoN = v
+		}
 	}
 
 	out := bufio.NewWriter(os.Stdout)
@@ -287,6 +302,50 @@ func runHeadless(cmd *cobra.Command, _ []string) error {
 	}
 
 	workDir, _ := os.Getwd()
+	patchPath := filepath.Join(workDir, "patch.diff")
+
+	// SWE-bench BO@N (Strategy b+): when --swe-bo-n>1 (or BANYA_SWE_BO_N>1)
+	// AND we are not in a Web-Bench layout, replace the standard single-shot
+	// agent + nudge + critic-revise + pytest-gate-revise chain with N
+	// independent samples. runBoN() applies the same banya verifier features
+	// per sample (capped revise budget) and writes the winner's patch back
+	// to patch.diff. After it returns we skip directly to the exit event.
+	wbLayoutEarly := webbench.Detect(workDir)
+	if sweBoN > 1 && !wbLayoutEarly.Active() {
+		var reviewer *critic.Reviewer
+		if criticEnabled {
+			reviewer = critic.NewFromEnv()
+		}
+		bonSessionSeed := fmt.Sprintf("bo-%d", time.Now().UnixNano())
+		winner, _ := runBoN(
+			cmd.Context(), out, pc,
+			bonSessionSeed,
+			promptText, promptTypeStr,
+			workDir, patchPath,
+			timeout, idleAbort, thinkingAbort, nudgeTimeout,
+			autoApprove,
+			sweBoN, sweBoTempMin, sweBoTempMax,
+			noPatchNudge,
+			reviewer, criticEnabled, criticIssueFile,
+			swePytestGate, swePytestTimeout,
+			sweBoReviseRounds,
+		)
+		exitReason := "swe_bo_n_done"
+		exitCode := 0
+		if winner == nil {
+			exitReason = "swe_bo_n_no_winner"
+			exitCode = 2
+		}
+		emitMeta(out, map[string]any{
+			"phase":      "exit",
+			"reason":     exitReason,
+			"elapsed_ms": time.Since(start).Milliseconds(),
+		})
+		if exitCode != 0 {
+			os.Exit(exitCode)
+		}
+		return nil
+	}
 
 	// First turn — the agent's initial attempt.
 	sessionID, exitReason, exitCode := runOneTurn(out, pc, protocol.ChatRequest{
@@ -296,7 +355,6 @@ func runHeadless(cmd *cobra.Command, _ []string) error {
 	}, timeout, idleAbort, thinkingAbort, autoApprove)
 	refreshPatchDiff(workDir, out)
 
-	patchPath := filepath.Join(workDir, "patch.diff")
 	patchExists := func() bool {
 		st, err := os.Stat(patchPath)
 		return err == nil && st.Size() > 0
