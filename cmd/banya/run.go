@@ -1105,6 +1105,31 @@ func errString(e error) string {
 // verbatim. Issue authors almost universally wrap function / class /
 // attribute names in backticks (markdown code-span). A fast regex
 // captures the right names with minimal false positives, no LLM call.
+//
+// v9 evidence: extracting from the WHOLE prompt picked up banya tool
+// names from the scaffold (`update_file`, `ast_search`, …) and the git
+// base-commit hash, polluting the nudge symbols and misleading the
+// agent. v10 filters those out via an exclusion set + git-hash regex.
+var nonIssueSymbolBlocklist = map[string]bool{
+	// Banya/R2E tool names — these appear in the scaffold prompt and
+	// SWE-bench plan boilerplate, not in the actual issue body.
+	"update_file": true, "create_file": true, "remove_file": true,
+	"run_command": true, "read_file": true, "ripgrep_search": true,
+	"glob_search": true, "ast_search": true, "list_files": true,
+	"run_reproducer": true, "finish_task": true, "load_skill": true,
+	"spawn_agent": true, "ExitPlanMode": true, "WebFetch": true,
+	// Workspace structural names.
+	"patch.diff": true, "repro.py": true, "reproduce_issue.py": true,
+	"plan.md": true, "testbed": true,
+	// Python keywords / language noise.
+	"True": true, "False": true, "None": true, "self": true, "cls": true,
+	"True/False": true,
+	// Shell / verbs that occasionally appear in backticks.
+	"cd": true, "ls": true, "git": true, "diff": true, "stage": true,
+}
+
+var gitHashRe = regexp.MustCompile(`^[a-f0-9]{7,40}$`)
+
 func extractIssueSymbols(prompt string) []string {
 	if prompt == "" {
 		return nil
@@ -1126,8 +1151,11 @@ func extractIssueSymbols(prompt string) []string {
 		if len(name) < 3 {
 			continue
 		}
-		switch name {
-		case "True", "False", "None", "self", "cls":
+		// Reject scaffold/tool names + git hashes (v9 lesson).
+		if nonIssueSymbolBlocklist[name] {
+			continue
+		}
+		if gitHashRe.MatchString(name) {
 			continue
 		}
 		counts[name]++
@@ -1205,6 +1233,50 @@ func buildNudgePromptWithSymbols(symbols []string) string {
 		"\n" +
 		"An imperfect patch will be reviewed by the critic and you will get a second chance to refine it. " +
 		"No patch = no second chance. Commit now."
+}
+
+// buildCommitForcePrompt is the maximally-directive last-resort message
+// sent in BO@N's commit-force phase (paper §10.5.7) when both the agent
+// run and the nudge failed to produce a non-empty patch.diff.
+//
+// v9 evidence: even with correct symbol extraction in the nudge, the
+// model can read the right file 17 times without ever calling
+// update_file. This prompt removes ambiguity — your single next tool
+// call must be update_file, on a file containing one of the named
+// symbols. No exploration is allowed.
+//
+// The prompt deliberately includes a fallback instruction ("if you
+// don't know what to fix, make ANY plausible edit") because for paper
+// purposes a wrong patch in a winning sample is still graded by the
+// critic and pytest gate, whereas no patch is an automatic 0.
+func buildCommitForcePrompt(symbols []string) string {
+	symbolBlock := ""
+	if len(symbols) > 0 {
+		quoted := make([]string, len(symbols))
+		for i, s := range symbols {
+			quoted[i] = "`" + s + "`"
+		}
+		symbolBlock = "\nIssue symbols (anchor your patch to one of these): " +
+			strings.Join(quoted, ", ") + "\n"
+	}
+	return "LAST CHANCE. The conversation has produced no patch.diff (or a 0-byte one). " +
+		"This is the commit-force phase — your ONE remaining tool call must be `update_file`.\n" +
+		symbolBlock +
+		"\n" +
+		"Hard constraints for this turn:\n" +
+		"1. Your next tool call MUST be `update_file`. NOT ast_search, NOT read_file, NOT ripgrep_search, " +
+		"NOT run_command. Just one update_file.\n" +
+		"2. The path you pass to update_file MUST be `repo/<...>` (not absolute, not bare).\n" +
+		"3. Edit a file containing one of the issue symbols listed above. You have already read enough; " +
+		"pick the most plausible target from the files you have seen.\n" +
+		"4. After update_file, immediately call `run_command` once to save patch.diff:\n" +
+		"   `cd repo && git add -A && git diff --cached > ../patch.diff && git restore --staged .`\n" +
+		"\n" +
+		"Decision rule: a wrong-but-plausible patch is graded by the critic and pytest gate and may " +
+		"earn partial credit. NO patch is an automatic 0. If you're unsure of the exact fix, " +
+		"choose the smallest minimal-impact edit you can defend (e.g. add the obvious recursion case, " +
+		"add the missing branch, fix the most-suspect line) and let the verifier decide. " +
+		"Don't keep exploring."
 }
 
 // buildRevisePrompt wraps the critic verdict so the agent can act on it.

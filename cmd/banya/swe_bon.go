@@ -55,6 +55,7 @@ type bonCandidate struct {
 	HasPatch    bool
 
 	NudgeFired      bool
+	CommitForced    bool
 	CriticRan       bool
 	CriticOK        bool
 	CriticRevised   bool
@@ -207,6 +208,43 @@ func runBoN(
 			}
 		}
 
+		// C2. Commit-force (paper §10.5.7 commit scaffold) — when even
+		// the nudge produced no patch, run one more turn with a maximally
+		// directive prompt that tells the agent its NEXT tool call MUST
+		// be update_file. Short timeout (half of nudgeTimeout, capped at
+		// 600s) so we don't burn budget on a non-committing model.
+		//
+		// v9 evidence (astropy-12907): sample 1 produced 17 read/search
+		// actions on the correct file (separable.py) but never reached
+		// update_file before per-sample timeout. The plain nudge gives
+		// the agent freedom; commit-force removes it.
+		if !noPatchNudge && exitCode != 3 && !patchExistsAt(patchPath) {
+			cfTimeout := nudgeTimeout / 2
+			if cfTimeout > 600*time.Second {
+				cfTimeout = 600 * time.Second
+			}
+			if cfTimeout < 60*time.Second {
+				cfTimeout = 60 * time.Second
+			}
+			emitMeta(out, map[string]any{
+				"phase":         "swe_bo_n_commit_force",
+				"index":         i,
+				"issue_symbols": issueSymbols,
+				"timeout_s":     int(cfTimeout.Seconds()),
+				"session_id":    sessionID,
+			})
+			_, _, _ = runOneTurn(out, pc, protocol.ChatRequest{
+				SessionID:  fmt.Sprintf("%s-bo%d", sessionID, i),
+				Message:    buildCommitForcePrompt(issueSymbols),
+				WorkDir:    workDir,
+				PromptType: protocol.PromptType(samplePromptType),
+			}, cfTimeout, idleAbort, thinkingAbort, autoApprove)
+			refreshPatchDiff(workDir, out)
+			if patchExistsAt(patchPath) {
+				c.CommitForced = true
+			}
+		}
+
 		// D. Critic review (+ 1 revise on reject if budget > 0).
 		if criticEnabled && reviewer != nil && patchExistsAt(patchPath) {
 			data, _ := os.ReadFile(patchPath)
@@ -292,6 +330,7 @@ func runBoN(
 			"has_patch":      c.HasPatch,
 			"patch_hash":     c.PatchHash,
 			"nudge_fired":    c.NudgeFired,
+			"commit_forced":  c.CommitForced,
 			"critic_ran":     c.CriticRan,
 			"critic_ok":      c.CriticOK,
 			"critic_revised": c.CriticRevised,
