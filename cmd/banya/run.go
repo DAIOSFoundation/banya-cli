@@ -1160,21 +1160,28 @@ func errString(e error) string {
 // investigating and commit to a best-guess patch. Grading rule: no patch
 // = 0, wrong patch = partial credit via critic REVISE, so ANY patch beats
 // silence.
-// extractIssueSymbols pulls candidate symbol names from the original
+// extractIssueSymbols pulls candidate symbol names from the SWE-bench
 // task prompt so they can be injected into the nudge prompt. The
 // extraction is heuristic — backtick-wrapped tokens that look like
 // Python identifiers — and we cap the result at 8 most-frequent
 // symbols to avoid drowning the nudge in irrelevant noise.
 //
-// Why heuristic: SWE-bench task prompts include the issue body
-// verbatim. Issue authors almost universally wrap function / class /
-// attribute names in backticks (markdown code-span). A fast regex
-// captures the right names with minimal false positives, no LLM call.
+// Evolution of this function:
+//   v9: extracted from the WHOLE prompt — picked up banya tool names
+//       (`update_file`, `ast_search`, …) and the git base-commit hash.
+//       Polluted nudges with framework jargon.
+//   v10: added blocklist for tool names + git-hash regex.
+//   v12: noticed the v9-style failure resurface on django-10914 because
+//       the scaffold preamble itself names example symbols (`_cstack`,
+//       `Table.to_pandas`) which then leak into every task's nudge. The
+//       fix is to slice the prompt at the `### Issue` marker (added by
+//       agent-evaluation/src/banya_eval/benchmarks/swe_bench.py) and
+//       extract symbols ONLY from the text after that marker — i.e. the
+//       actual issue body, not the framework boilerplate.
 //
-// v9 evidence: extracting from the WHOLE prompt picked up banya tool
-// names from the scaffold (`update_file`, `ast_search`, …) and the git
-// base-commit hash, polluting the nudge symbols and misleading the
-// agent. v10 filters those out via an exclusion set + git-hash regex.
+// Fallback: if the marker is missing (e.g. when this is called from a
+// non-SWE-bench codepath), we extract from the whole prompt with the
+// expanded blocklist as a safety net.
 var nonIssueSymbolBlocklist = map[string]bool{
 	// Banya/R2E tool names — these appear in the scaffold prompt and
 	// SWE-bench plan boilerplate, not in the actual issue body.
@@ -1191,18 +1198,52 @@ var nonIssueSymbolBlocklist = map[string]bool{
 	"True/False": true,
 	// Shell / verbs that occasionally appear in backticks.
 	"cd": true, "ls": true, "git": true, "diff": true, "stage": true,
+	// Scaffold preamble noise — concrete symbols named in the
+	// SWE-specific protocol section as illustrative examples
+	// (`_cstack`, `Table.to_pandas`) or in meta-discussion text
+	// (`unresolved` — used to describe failure modes, not as a code
+	// symbol). v11 django-10914 evidence: these contaminated the nudge
+	// when extraction ran on the whole prompt. The marker-based slice
+	// (above) is the primary defence; this list is the safety net for
+	// the fallback path.
+	"_cstack": true, "Table.to_pandas": true, "unresolved": true,
 }
 
 var gitHashRe = regexp.MustCompile(`^[a-f0-9]{7,40}$`)
+
+// issueBodyMarkerRe matches the `### Issue` heading the SWE-bench
+// harness inserts to delimit the start of the verbatim issue body.
+var issueBodyMarkerRe = regexp.MustCompile(`(?m)^\s*###\s+Issue\s*$`)
+
+// sliceToIssueBody returns the substring of `prompt` starting from the
+// first `### Issue` heading (exclusive). Returns "" when the marker is
+// absent — caller should fall back to the whole prompt with the
+// blocklist applied.
+func sliceToIssueBody(prompt string) string {
+	loc := issueBodyMarkerRe.FindStringIndex(prompt)
+	if loc == nil {
+		return ""
+	}
+	return prompt[loc[1]:]
+}
 
 func extractIssueSymbols(prompt string) []string {
 	if prompt == "" {
 		return nil
 	}
+	// Primary path: extract from issue body only. The scaffold preamble
+	// (which names example symbols like `_cstack`) is excluded by the
+	// slice — eliminates the entire class of cross-task contamination.
+	target := sliceToIssueBody(prompt)
+	if target == "" {
+		// Fallback: marker missing; use the whole prompt and rely on
+		// the blocklist + git-hash filter to catch obvious noise.
+		target = prompt
+	}
 	// Match `<identifier>` where identifier is a Python-style name,
 	// optionally with a trailing `()` to capture method invocations.
 	re := regexp.MustCompile("`([A-Za-z_][A-Za-z0-9_]{1,80})(\\(\\))?`")
-	matches := re.FindAllStringSubmatch(prompt, -1)
+	matches := re.FindAllStringSubmatch(target, -1)
 	if len(matches) == 0 {
 		return nil
 	}
