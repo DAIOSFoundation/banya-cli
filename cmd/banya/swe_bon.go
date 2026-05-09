@@ -112,6 +112,15 @@ func runBoN(
 		}
 	}
 
+	// Wipe stale .agent state from prior runs of this workspace. SWE-bench
+	// workspaces persist across launches (results/workspaces/<task_id>/),
+	// so a previously-killed run leaves a `trajectory.jsonl` (and any
+	// `trajectory.bo*.jsonl` backups) that can confuse the SIBDD
+	// classifier and produce false BO@N events when the new run starts.
+	// We tolerate missing dir / files silently — every workspace begins
+	// fresh in BO@N's eyes.
+	cleanStaleAgentDir(workDir, out)
+
 	emitMeta(out, map[string]any{
 		"phase":               "swe_bo_n_start",
 		"n":                   n,
@@ -466,6 +475,41 @@ func optCritic(c *bonCandidate) string {
 		return "ok"
 	}
 	return "reject"
+}
+
+// cleanStaleAgentDir removes any prior-run trajectory.jsonl and
+// trajectory.bo<i>.jsonl backups from the workspace's `.agent/` dir at
+// the start of a fresh BO@N run. Patches and other workspace files are
+// handled by `resetSWEWorkspace` per-sample; this helper specifically
+// targets agent telemetry files that survived a killed previous run.
+//
+// v7 evidence: matplotlib's workspace `.agent/trajectory.jsonl` carried
+// `swe_bo_n_sample_done` events from a v6 run that was killed mid-task,
+// causing the SIBDD classifier to read those stale events as if they
+// belonged to v7.
+func cleanStaleAgentDir(workDir string, out *bufio.Writer) {
+	agentDir := filepath.Join(workDir, ".agent")
+	st, err := os.Stat(agentDir)
+	if err != nil || !st.IsDir() {
+		return
+	}
+	removed := 0
+	if err := os.Remove(filepath.Join(agentDir, "trajectory.jsonl")); err == nil {
+		removed++
+	}
+	matches, _ := filepath.Glob(filepath.Join(agentDir, "trajectory.bo*.jsonl"))
+	for _, p := range matches {
+		if err := os.Remove(p); err == nil {
+			removed++
+		}
+	}
+	if removed > 0 {
+		emitMeta(out, map[string]any{
+			"phase":          "swe_bo_n_clean_stale_agent",
+			"removed_count":  removed,
+			"agent_dir":      agentDir,
+		})
+	}
 }
 
 // copyFileForBackup copies src → dst for the BO@N per-sample trajectory

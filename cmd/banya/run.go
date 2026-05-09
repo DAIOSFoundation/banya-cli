@@ -1096,9 +1096,12 @@ func buildNudgePrompt() string {
 		"You already have enough signal from the tools you ran. Do NOT call ast_search, read_file, " +
 		"glob_search, or ripgrep_search again in this turn.\n\n" +
 		"Now, in this order:\n" +
-		"1. Pick the single most-suspect symbol / function based on what you've already read.\n" +
-		"2. Call update_file on its source file with your best-guess minimal fix. (skipping this step " +
-		"is the most common cause of empty patch.diff — do not skip)\n" +
+		"1. Pick the symbol *explicitly named in the issue text* (function, class, method, attribute). " +
+		"Do NOT pick a different symbol you happen to know about in this repo — that is hallucination, " +
+		"and a patch on the wrong symbol scores 0 even if it looks reasonable. The hidden tests only " +
+		"exercise the named symbol.\n" +
+		"2. Call update_file on the source file *that contains that symbol* with your best-guess " +
+		"minimal fix. (skipping this step is the most common cause of empty patch.diff — do not skip)\n" +
 		"3. Regenerate patch.diff (only AFTER the update_file in step 2):\n" +
 		"   cd repo && git add -A && git diff --cached > ../patch.diff && git restore --staged .\n" +
 		"4. Verify patch.diff is non-empty: `ls -l patch.diff`. If it shows 0 bytes, you skipped " +
