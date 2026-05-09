@@ -647,6 +647,35 @@ func runOneTurn(
 	sawTool := false
 	exitReason = "done"
 
+	// Write-tool deadline (BANYA_SWE_WRITE_TOOL_DEADLINE_S) — abort the
+	// turn if no patch-producing tool (update_file / create_file /
+	// remove_file / run_command) has been called within this many seconds.
+	// Catches the v6 matplotlib pattern: 24 list_files / read_file calls
+	// with zero update_file before timeout.
+	var writeDeadlineCh <-chan time.Time
+	var writeDeadlineTimer *time.Timer
+	if v := os.Getenv("BANYA_SWE_WRITE_TOOL_DEADLINE_S"); v != "" {
+		if secs, err := strconv.Atoi(v); err == nil && secs > 0 {
+			writeDeadlineTimer = time.NewTimer(time.Duration(secs) * time.Second)
+			writeDeadlineCh = writeDeadlineTimer.C
+		}
+	}
+	sawWriteTool := false
+
+	// Repeated-identical-call detection (BANYA_SWE_REPEAT_CALL_LIMIT) —
+	// when the same (toolName, input) is observed N consecutive times,
+	// abort. Catches v6 matplotlib's `list_files .` ×3 and similar
+	// shotgunning patterns where the agent ignores prior observations.
+	repeatLimit := 0
+	if v := os.Getenv("BANYA_SWE_REPEAT_CALL_LIMIT"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			repeatLimit = n
+		}
+	}
+	var lastCallSig string
+	repeatCount := 0
+	repeatedCallSig := ""
+
 loop:
 	for {
 		select {
@@ -685,6 +714,33 @@ loop:
 						thinkingTimer.Reset(thinkingAbort)
 					}
 				}
+				// Write-tool deadline: stop the timer permanently the
+				// first time we see a write tool (the agent is now
+				// committing to changes, no need to keep watching).
+				toolName := extractStringField(evt.Data, "tool_name")
+				if !sawWriteTool && isWriteTool(toolName) {
+					sawWriteTool = true
+					if writeDeadlineTimer != nil {
+						writeDeadlineTimer.Stop()
+						writeDeadlineCh = nil
+					}
+				}
+				// Repeated-identical-call detection.
+				if repeatLimit > 0 {
+					sig := buildToolCallSignature(toolName, evt.Data)
+					if sig != "" && sig == lastCallSig {
+						repeatCount++
+						if repeatCount >= repeatLimit {
+							repeatedCallSig = sig
+							exitReason = "repeated_identical_call"
+							exitCode = 2
+							break loop
+						}
+					} else {
+						lastCallSig = sig
+						repeatCount = 1
+					}
+				}
 			case protocol.EventApprovalNeeded:
 				if autoApprove {
 					id := extractStringField(evt.Data, "tool_call_id")
@@ -718,9 +774,77 @@ loop:
 			exitReason = "thinking_abort"
 			exitCode = 2
 			break loop
+		case <-writeDeadlineCh:
+			// No write tool (update_file / create_file / remove_file /
+			// run_command) was called within the deadline. The agent is
+			// almost certainly stuck in a read/search exploration loop;
+			// terminate so the b+ nudge can fire with the
+			// commit-now instruction.
+			exitReason = "write_tool_deadline"
+			exitCode = 2
+			break loop
 		}
 	}
+	if exitReason == "repeated_identical_call" {
+		emitMeta(out, map[string]any{
+			"phase":     "repeated_call_abort",
+			"signature": repeatedCallSig,
+			"count":     repeatCount,
+			"limit":     repeatLimit,
+		})
+	}
+	if exitReason == "write_tool_deadline" {
+		emitMeta(out, map[string]any{
+			"phase": "write_tool_deadline_abort",
+		})
+	}
 	return sessionID, exitReason, exitCode
+}
+
+// isWriteTool returns true for tools that produce a code-mutating
+// effect — whether through banya's filesystem tools (update_file,
+// create_file, remove_file) or shell escapes (run_command). The
+// write-tool deadline is satisfied as soon as any of these is observed.
+func isWriteTool(name string) bool {
+	switch name {
+	case "update_file", "create_file", "remove_file", "run_command":
+		return true
+	}
+	return false
+}
+
+// buildToolCallSignature renders a stable string for the
+// repeated-identical-call detector. Uses the tool name plus a JSON
+// re-marshalling of the input map so identical args always hash the
+// same. Returns "" when the tool name is missing — that disables the
+// detector for the malformed event rather than producing false
+// positives.
+func buildToolCallSignature(toolName string, data any) string {
+	if toolName == "" {
+		return ""
+	}
+	var input any
+	if m, ok := data.(map[string]any); ok {
+		input = m["input"]
+	} else {
+		// Fall back to JSON round-trip — same idiom as extractStringField.
+		b, err := json.Marshal(data)
+		if err != nil {
+			return toolName + ":?"
+		}
+		var m map[string]any
+		if json.Unmarshal(b, &m) == nil {
+			input = m["input"]
+		}
+	}
+	if input == nil {
+		return toolName + ":∅"
+	}
+	b, err := json.Marshal(input)
+	if err != nil {
+		return toolName + ":?"
+	}
+	return toolName + ":" + string(b)
 }
 
 // readIssueForCritic returns the text the critic should compare the patch
