@@ -1543,30 +1543,23 @@ func buildCommitForcePrompt(symbols []string, fileHint string) string {
 		b.WriteString("Begin your next response with: \"I have enough context. I'll apply the fix now.\"\n\n")
 	}
 
-	// Format example primes the tool call shape.
-	b.WriteString("Then call update_file in this exact shape:\n")
+	// Format example primes the tool call shape. Keep this short —
+	// v13 evidence (astropy 14K mega-patch with 7 files) showed that
+	// adding lots of warnings to commit-force backfires: the model
+	// reads the verbose prompt as an invitation to elaborate rather
+	// than as a directive to commit. v14 trims back to the v12 shape
+	// (single 1-3 line edit hint inline in the format example, no
+	// separate EDIT GRANULARITY subsection).
+	b.WriteString("Then call update_file with a SHORT SEARCH (1-3 lines, copied verbatim from the file — not a whole method):\n")
 	b.WriteString("    update_file(\n")
 	if fileHint != "" {
 		b.WriteString("      path=\"" + fileHint + "\",\n")
 	} else {
 		b.WriteString("      path=\"repo/<package>/<module>.py\",\n")
 	}
-	b.WriteString("      old_string=\"<a SHORT span of 1-3 specific lines that contain the bug — verbatim from the file>\",\n")
+	b.WriteString("      old_string=\"<the 1-3 buggy lines, verbatim>\",\n")
 	b.WriteString("      new_string=\"<the fixed line(s)>\"\n")
 	b.WriteString("    )\n\n")
-
-	// Edit-granularity warning. v12 evidence: SEARCH text containing
-	// docstrings + method signatures + multi-line bodies fails to match
-	// silently because of whitespace / quote-style / line-ending
-	// differences. Sample 0 ended with an 87-byte garbage patch
-	// (`patch.diff` itself staged) because update_file's SEARCH didn't
-	// match the actual file content. Force the model toward small,
-	// matchable SEARCH blocks.
-	b.WriteString("**EDIT GRANULARITY (load-bearing)**:\n")
-	b.WriteString("- SEARCH (`old_string`) MUST be 1-3 lines. NOT a whole method, NOT a docstring + body.\n")
-	b.WriteString("- The longer the SEARCH, the higher the chance it fails to match (whitespace / indent / quote-style differences are invisible to you but fatal to update_file).\n")
-	b.WriteString("- Pick the single line that implements the bug. Add at most 1-2 surrounding lines if needed for uniqueness.\n")
-	b.WriteString("- If a previous update_file failed with \"SEARCH text not found\", do NOT retry with the same string. Read a narrow line range first to see the EXACT current formatting (leading whitespace, comment style), then construct a smaller SEARCH.\n\n")
 
 	b.WriteString("Then call run_command exactly once to save the patch:\n")
 	b.WriteString("    run_command(\"cd repo && git add -A && git diff --cached > ../patch.diff && git restore --staged .\")\n\n")
