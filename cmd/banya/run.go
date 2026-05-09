@@ -961,14 +961,25 @@ func errString(e error) string {
 // = 0, wrong patch = partial credit via critic REVISE, so ANY patch beats
 // silence.
 func buildNudgePrompt() string {
-	return "STOP. Your previous turn finished without producing patch.diff — that is an automatic 0.\n" +
+	return "STOP. Your previous turn finished without producing patch.diff (or with patch.diff EMPTY — " +
+		"0 bytes) — that is an automatic 0.\n" +
+		"\n" +
+		"Diagnosis hint: an empty patch.diff usually means you ran `git diff --cached` BEFORE staging " +
+		"any code edits. Calling git diff without first calling `update_file` produces an empty diff. " +
+		"You MUST call update_file (or create_file) at least once on a real source file BEFORE " +
+		"regenerating the patch.\n" +
+		"\n" +
 		"You already have enough signal from the tools you ran. Do NOT call ast_search, read_file, " +
 		"glob_search, or ripgrep_search again in this turn.\n\n" +
 		"Now, in this order:\n" +
 		"1. Pick the single most-suspect symbol / function based on what you've already read.\n" +
-		"2. Call update_file on its source file with your best-guess minimal fix.\n" +
-		"3. Regenerate patch.diff:\n" +
-		"   cd repo && git add -A && git diff --cached > ../patch.diff && git restore --staged .\n\n" +
+		"2. Call update_file on its source file with your best-guess minimal fix. (skipping this step " +
+		"is the most common cause of empty patch.diff — do not skip)\n" +
+		"3. Regenerate patch.diff (only AFTER the update_file in step 2):\n" +
+		"   cd repo && git add -A && git diff --cached > ../patch.diff && git restore --staged .\n" +
+		"4. Verify patch.diff is non-empty: `ls -l patch.diff`. If it shows 0 bytes, you skipped " +
+		"step 2 — go back and call update_file.\n" +
+		"\n" +
 		"An imperfect patch will be reviewed by the critic and you will get a second chance to refine it. " +
 		"No patch = no second chance. Commit now."
 }
