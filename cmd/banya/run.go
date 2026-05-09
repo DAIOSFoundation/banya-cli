@@ -8,6 +8,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -452,14 +454,16 @@ func runHeadless(cmd *cobra.Command, _ []string) error {
 	// turn with a tighter budget so the agent can lock in ANY patch.
 	if !wbLayout.Active() && !noPatchNudge && !nudgedThisRun && exitCode != 3 && !patchExists() {
 		nudgedThisRun = true
+		issueSymbols := extractIssueSymbols(promptText)
 		emitMeta(out, map[string]any{
-			"phase":      "nudge",
-			"prev_exit":  exitReason,
-			"session_id": sessionID,
+			"phase":         "nudge",
+			"prev_exit":     exitReason,
+			"issue_symbols": issueSymbols,
+			"session_id":    sessionID,
 		})
 		_, exitReason, exitCode = runOneTurn(out, pc, protocol.ChatRequest{
 			SessionID:  sessionID, // continue the same conversation
-			Message:    buildNudgePrompt(),
+			Message:    buildNudgePromptWithSymbols(issueSymbols),
 			WorkDir:    workDir,
 			PromptType: protocol.PromptType(promptTypeStr),
 		}, nudgeTimeout, idleAbort, thinkingAbort, autoApprove)
@@ -802,12 +806,19 @@ loop:
 }
 
 // isWriteTool returns true for tools that produce a code-mutating
-// effect — whether through banya's filesystem tools (update_file,
-// create_file, remove_file) or shell escapes (run_command). The
-// write-tool deadline is satisfied as soon as any of these is observed.
+// effect on the source tree. The write-tool deadline is satisfied as
+// soon as any of these is observed.
+//
+// `run_command` is intentionally EXCLUDED here — empirically (v8
+// django, action 12: `cat patch.diff`) the agent uses run_command for
+// read-only diagnostics that should not satisfy the deadline. Real
+// patch creation requires staged edits, which only the file-mutation
+// tools produce. Removing run_command tightens the safety-net to its
+// intended purpose: catch the "24 read/searches without ever editing"
+// pattern.
 func isWriteTool(name string) bool {
 	switch name {
-	case "update_file", "create_file", "remove_file", "run_command":
+	case "update_file", "create_file", "remove_file":
 		return true
 	}
 	return false
@@ -1084,9 +1095,94 @@ func errString(e error) string {
 // investigating and commit to a best-guess patch. Grading rule: no patch
 // = 0, wrong patch = partial credit via critic REVISE, so ANY patch beats
 // silence.
+// extractIssueSymbols pulls candidate symbol names from the original
+// task prompt so they can be injected into the nudge prompt. The
+// extraction is heuristic — backtick-wrapped tokens that look like
+// Python identifiers — and we cap the result at 8 most-frequent
+// symbols to avoid drowning the nudge in irrelevant noise.
+//
+// Why heuristic: SWE-bench task prompts include the issue body
+// verbatim. Issue authors almost universally wrap function / class /
+// attribute names in backticks (markdown code-span). A fast regex
+// captures the right names with minimal false positives, no LLM call.
+func extractIssueSymbols(prompt string) []string {
+	if prompt == "" {
+		return nil
+	}
+	// Match `<identifier>` where identifier is a Python-style name,
+	// optionally with a trailing `()` to capture method invocations.
+	re := regexp.MustCompile("`([A-Za-z_][A-Za-z0-9_]{1,80})(\\(\\))?`")
+	matches := re.FindAllStringSubmatch(prompt, -1)
+	if len(matches) == 0 {
+		return nil
+	}
+	// Frequency-rank: the more often the issue mentions a name, the
+	// more central it likely is to the bug.
+	counts := map[string]int{}
+	for _, m := range matches {
+		name := m[1]
+		// Skip common false positives — Python keywords, very short
+		// fragments, and pure-digit identifiers.
+		if len(name) < 3 {
+			continue
+		}
+		switch name {
+		case "True", "False", "None", "self", "cls":
+			continue
+		}
+		counts[name]++
+	}
+	if len(counts) == 0 {
+		return nil
+	}
+	type kv struct {
+		k string
+		v int
+	}
+	ranked := make([]kv, 0, len(counts))
+	for k, v := range counts {
+		ranked = append(ranked, kv{k, v})
+	}
+	sort.Slice(ranked, func(i, j int) bool {
+		if ranked[i].v != ranked[j].v {
+			return ranked[i].v > ranked[j].v
+		}
+		return ranked[i].k < ranked[j].k
+	})
+	if len(ranked) > 8 {
+		ranked = ranked[:8]
+	}
+	out := make([]string, 0, len(ranked))
+	for _, kv := range ranked {
+		out = append(out, kv.k)
+	}
+	return out
+}
+
 func buildNudgePrompt() string {
+	return buildNudgePromptWithSymbols(nil)
+}
+
+// buildNudgePromptWithSymbols renders the commit-now nudge with an
+// optional concrete list of issue symbols extracted from the prompt.
+// When the symbols are non-empty, they are inlined verbatim so the
+// agent has the exact strings to grep for and patch — much harder to
+// hallucinate a different bug than when only generic guidance is given.
+func buildNudgePromptWithSymbols(symbols []string) string {
+	symbolHint := ""
+	if len(symbols) > 0 {
+		quoted := make([]string, len(symbols))
+		for i, s := range symbols {
+			quoted[i] = "`" + s + "`"
+		}
+		symbolHint = "\nThe issue text names these symbols (most-frequent first): " +
+			strings.Join(quoted, ", ") + ".\n" +
+			"Your patch MUST modify a file containing one of these symbols. " +
+			"Use ripgrep_search to confirm the symbol's location if you don't already know it.\n"
+	}
 	return "STOP. Your previous turn finished without producing patch.diff (or with patch.diff EMPTY — " +
 		"0 bytes) — that is an automatic 0.\n" +
+		symbolHint +
 		"\n" +
 		"Diagnosis hint: an empty patch.diff usually means you ran `git diff --cached` BEFORE staging " +
 		"any code edits. Calling git diff without first calling `update_file` produces an empty diff. " +

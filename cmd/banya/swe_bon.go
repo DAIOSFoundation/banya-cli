@@ -121,6 +121,10 @@ func runBoN(
 	// fresh in BO@N's eyes.
 	cleanStaleAgentDir(workDir, out)
 
+	// Extract issue symbols once for this task — every sample's nudge
+	// reuses the same list, since the issue is the same across samples.
+	issueSymbols := extractIssueSymbols(promptText)
+
 	emitMeta(out, map[string]any{
 		"phase":               "swe_bo_n_start",
 		"n":                   n,
@@ -128,6 +132,7 @@ func runBoN(
 		"temp_max":            tempMax,
 		"revise_per_phase":    revisePerPhase,
 		"per_sample_timeout_s": int(effectiveTimeout.Seconds()),
+		"issue_symbols":       issueSymbols,
 		"session_id":          sessionID,
 	})
 
@@ -187,11 +192,12 @@ func runBoN(
 				"phase":           "swe_bo_n_nudge",
 				"index":           i,
 				"after_exit_code": exitCode,
+				"issue_symbols":   issueSymbols,
 				"session_id":      sessionID,
 			})
 			_, _, _ = runOneTurn(out, pc, protocol.ChatRequest{
 				SessionID:  fmt.Sprintf("%s-bo%d", sessionID, i),
-				Message:    buildNudgePrompt(),
+				Message:    buildNudgePromptWithSymbols(issueSymbols),
 				WorkDir:    workDir,
 				PromptType: protocol.PromptType(samplePromptType),
 			}, nudgeTimeout, idleAbort, thinkingAbort, autoApprove)
