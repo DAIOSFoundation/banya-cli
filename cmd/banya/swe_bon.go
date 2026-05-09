@@ -6,6 +6,7 @@ import (
 	"crypto/sha1"
 	"encoding/hex"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -76,6 +77,7 @@ func runBoN(
 	promptText, promptTypeStr string,
 	workDir, patchPath string,
 	timeout, idleAbort, thinkingAbort, nudgeTimeout time.Duration,
+	perSampleTimeout time.Duration, // 0 = auto (timeout / N)
 	autoApprove bool,
 	n int,
 	tempMin, tempMax float64,
@@ -92,13 +94,32 @@ func runBoN(
 		return nil, nil
 	}
 
+	// Per-sample timeout: when non-zero, each sample's runOneTurn (and its
+	// critic-revise / pytest-revise turns) get THIS budget instead of the
+	// overall task timeout. Without this, sample 0 can monopolise the whole
+	// task budget, leaving sample 1 with effectively no time — observed in
+	// the v6 smoke (astropy: sample 0 ~43 min, sample 1 4 tool calls).
+	//
+	// Auto mode (perSampleTimeout == 0): split overall timeout evenly across
+	// N samples, with a 60s floor and a per-sample headroom for the b+
+	// auxiliary turns (nudge / 2× revise) — those use their own timeouts so
+	// the agent run itself can take effectively the full slice.
+	effectiveTimeout := perSampleTimeout
+	if effectiveTimeout <= 0 {
+		effectiveTimeout = timeout / time.Duration(n)
+		if effectiveTimeout < 60*time.Second {
+			effectiveTimeout = 60 * time.Second
+		}
+	}
+
 	emitMeta(out, map[string]any{
-		"phase":            "swe_bo_n_start",
-		"n":                n,
-		"temp_min":         tempMin,
-		"temp_max":         tempMax,
-		"revise_per_phase": revisePerPhase,
-		"session_id":       sessionID,
+		"phase":               "swe_bo_n_start",
+		"n":                   n,
+		"temp_min":            tempMin,
+		"temp_max":            tempMax,
+		"revise_per_phase":    revisePerPhase,
+		"per_sample_timeout_s": int(effectiveTimeout.Seconds()),
+		"session_id":          sessionID,
 	})
 
 	candidates = make([]bonCandidate, 0, n)
@@ -138,7 +159,7 @@ func runBoN(
 			Message:    promptText,
 			WorkDir:    workDir,
 			PromptType: protocol.PromptType(samplePromptType),
-		}, timeout, idleAbort, thinkingAbort, autoApprove)
+		}, effectiveTimeout, idleAbort, thinkingAbort, autoApprove)
 		refreshPatchDiff(workDir, out)
 		c.Notes = fmt.Sprintf("agent_exit=%s", exitReason)
 		if exitCode != 0 {
@@ -146,11 +167,18 @@ func runBoN(
 		}
 
 		// C. Nudge if no patch.diff (banya feature).
-		if !noPatchNudge && exitCode == 0 && !patchExistsAt(patchPath) {
+		//
+		// Gate on `exitCode != 3` (sidecar / chat-start error) instead of
+		// `exitCode == 0`. The original guard skipped the nudge whenever the
+		// sample hit timeout (exitCode 2) — exactly the case where the
+		// commit-now nudge has the highest leverage. Sidecar errors (3) are
+		// still excluded because the chat session itself is unhealthy.
+		if !noPatchNudge && exitCode != 3 && !patchExistsAt(patchPath) {
 			emitMeta(out, map[string]any{
-				"phase":      "swe_bo_n_nudge",
-				"index":      i,
-				"session_id": sessionID,
+				"phase":           "swe_bo_n_nudge",
+				"index":           i,
+				"after_exit_code": exitCode,
+				"session_id":      sessionID,
 			})
 			_, _, _ = runOneTurn(out, pc, protocol.ChatRequest{
 				SessionID:  fmt.Sprintf("%s-bo%d", sessionID, i),
@@ -180,7 +208,7 @@ func runBoN(
 						Message:    revisePrompt,
 						WorkDir:    workDir,
 						PromptType: protocol.PromptType(samplePromptType),
-					}, timeout, idleAbort, thinkingAbort, autoApprove)
+					}, effectiveTimeout, idleAbort, thinkingAbort, autoApprove)
 					refreshPatchDiff(workDir, out)
 					c.CriticRevised = true
 					if patchExistsAt(patchPath) {
@@ -213,7 +241,7 @@ func runBoN(
 						Message:    revisePrompt,
 						WorkDir:    workDir,
 						PromptType: protocol.PromptType(samplePromptType),
-					}, timeout, idleAbort, thinkingAbort, autoApprove)
+					}, effectiveTimeout, idleAbort, thinkingAbort, autoApprove)
 					refreshPatchDiff(workDir, out)
 					c.PytestRevised = true
 					if patchExistsAt(patchPath) {
@@ -259,6 +287,25 @@ func runBoN(
 			"session_id":     sessionID,
 		})
 		candidates = append(candidates, c)
+
+		// Trajectory backup. The next sample's banya-core invocation
+		// truncates `.agent/trajectory.jsonl` (observed empirically in v6:
+		// sample 0 had ~41 tool calls but its trajectory was wiped when
+		// sample 1 started). When BANYA_SWE_BO_KEEP_LOSERS=1 is set, copy
+		// the full trajectory to `trajectory.bo<i>.jsonl` so the SIBDD
+		// exporter can materialise per-sample preference data.
+		if os.Getenv("BANYA_SWE_BO_KEEP_LOSERS") == "1" {
+			src := filepath.Join(workDir, ".agent", "trajectory.jsonl")
+			dst := filepath.Join(workDir, ".agent", fmt.Sprintf("trajectory.bo%d.jsonl", i))
+			if err := copyFileForBackup(src, dst); err == nil {
+				emitMeta(out, map[string]any{
+					"phase":      "swe_bo_n_trajectory_backup",
+					"index":      i,
+					"path":       dst,
+					"session_id": sessionID,
+				})
+			}
+		}
 
 		_ = os.Unsetenv("BANYA_SWE_BO_TEMPERATURE")
 		_ = os.Unsetenv("BANYA_SWE_BO_TOP_P")
@@ -419,4 +466,25 @@ func optCritic(c *bonCandidate) string {
 		return "ok"
 	}
 	return "reject"
+}
+
+// copyFileForBackup copies src → dst for the BO@N per-sample trajectory
+// backup (paper §10.5.7). Best-effort: a missing src is silently tolerated
+// (some samples may not have produced a trajectory if the agent crashed
+// at chat-start time).
+func copyFileForBackup(src, dst string) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	out, err := os.Create(dst)
+	if err != nil {
+		return err
+	}
+	defer out.Close()
+	if _, err := io.Copy(out, in); err != nil {
+		return err
+	}
+	return out.Sync()
 }

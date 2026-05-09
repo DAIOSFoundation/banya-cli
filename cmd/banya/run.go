@@ -72,6 +72,7 @@ Intended for eval harnesses that drive the agent programmatically.`,
 	cmd.Flags().Float64("swe-bo-temp-min", 0.7, "BO@N: minimum temperature across samples (linear spread to --swe-bo-temp-max). Default 0.7.")
 	cmd.Flags().Float64("swe-bo-temp-max", 1.0, "BO@N: maximum temperature across samples. Default 1.0.")
 	cmd.Flags().Int("swe-bo-revise-rounds", 1, "BO@N per-sample revise budget: 0 = pure BO@N (no per-sample revise), 1 = b+ default (1 critic-revise + 1 pytest-revise per sample), 2+ = aggressive polishing per sample.")
+	cmd.Flags().Duration("swe-bo-per-sample-timeout", 0, "BO@N per-sample timeout (default 0 = auto: overall --timeout / N, with 60s floor). Without this, sample 0 can monopolise the whole task budget and starve later samples — observed empirically.")
 	return cmd
 }
 
@@ -131,6 +132,7 @@ func runHeadless(cmd *cobra.Command, _ []string) error {
 	sweBoTempMin, _ := cmd.Flags().GetFloat64("swe-bo-temp-min")
 	sweBoTempMax, _ := cmd.Flags().GetFloat64("swe-bo-temp-max")
 	sweBoReviseRounds, _ := cmd.Flags().GetInt("swe-bo-revise-rounds")
+	sweBoPerSampleTimeout, _ := cmd.Flags().GetDuration("swe-bo-per-sample-timeout")
 	// Env override for harness convenience.
 	if envN := os.Getenv("BANYA_SWE_BO_N"); envN != "" {
 		if v, err := strconv.Atoi(envN); err == nil && v > sweBoN {
@@ -323,6 +325,7 @@ func runHeadless(cmd *cobra.Command, _ []string) error {
 			promptText, promptTypeStr,
 			workDir, patchPath,
 			timeout, idleAbort, thinkingAbort, nudgeTimeout,
+			sweBoPerSampleTimeout,
 			autoApprove,
 			sweBoN, sweBoTempMin, sweBoTempMax,
 			noPatchNudge,
