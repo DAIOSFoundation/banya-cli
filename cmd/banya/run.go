@@ -455,15 +455,17 @@ func runHeadless(cmd *cobra.Command, _ []string) error {
 	if !wbLayout.Active() && !noPatchNudge && !nudgedThisRun && exitCode != 3 && !patchExists() {
 		nudgedThisRun = true
 		issueSymbols := extractIssueSymbols(promptText)
+		fileHint := extractMostReadSourceFile(workDir)
 		emitMeta(out, map[string]any{
 			"phase":         "nudge",
 			"prev_exit":     exitReason,
 			"issue_symbols": issueSymbols,
+			"file_hint":     fileHint,
 			"session_id":    sessionID,
 		})
 		_, exitReason, exitCode = runOneTurn(out, pc, protocol.ChatRequest{
 			SessionID:  sessionID, // continue the same conversation
-			Message:    buildNudgePromptWithSymbols(issueSymbols),
+			Message:    buildNudgePromptWithSymbols(issueSymbols, fileHint),
 			WorkDir:    workDir,
 			PromptType: protocol.PromptType(promptTypeStr),
 		}, nudgeTimeout, idleAbort, thinkingAbort, autoApprove)
@@ -680,6 +682,16 @@ func runOneTurn(
 	repeatCount := 0
 	repeatedCallSig := ""
 
+	// Plan-stage tracking (paper §10.5.7) — every tool call is mapped
+	// to one of seven plan stages and a `plan_stage_enter` meta event
+	// is emitted on transition. Useful for post-hoc SIBDD analysis:
+	// "samples that hit FIX = succeeded; samples stuck in STUDY =
+	// capability ceiling". Counts also feed the future v12
+	// stage-stuck nudge.
+	currentStage := stageUnknown
+	stageCounts := map[planStage]int{}
+	sawFix := false
+
 loop:
 	for {
 		select {
@@ -745,6 +757,22 @@ loop:
 						repeatCount = 1
 					}
 				}
+				// Plan-stage classification.
+				inputPath, inputCmd := extractToolInputs(evt.Data)
+				if !sawFix && (toolName == "update_file" || toolName == "create_file" || toolName == "remove_file") {
+					sawFix = true
+				}
+				stage := classifyStage(toolName, inputPath, inputCmd, sawFix)
+				if stage != stageUnknown && stage != currentStage {
+					emitMeta(out, map[string]any{
+						"phase":      "plan_stage_enter",
+						"from_stage": currentStage.String(),
+						"to_stage":   stage.String(),
+						"tool":       toolName,
+					})
+					currentStage = stage
+				}
+				stageCounts[stage]++
 			case protocol.EventApprovalNeeded:
 				if autoApprove {
 					id := extractStringField(evt.Data, "tool_call_id")
@@ -802,7 +830,44 @@ loop:
 			"phase": "write_tool_deadline_abort",
 		})
 	}
+	// Plan-stage summary at turn-end so SIBDD can read a single
+	// per-turn stage histogram without re-walking the trajectory.
+	if len(stageCounts) > 0 {
+		summary := map[string]int{}
+		for k, v := range stageCounts {
+			summary[k.String()] = v
+		}
+		emitMeta(out, map[string]any{
+			"phase":         "plan_stage_summary",
+			"final_stage":   currentStage.String(),
+			"stage_counts":  summary,
+			"saw_fix":       sawFix,
+			"total_calls":   func() int { n := 0; for _, v := range stageCounts { n += v }; return n }(),
+		})
+	}
 	return sessionID, exitReason, exitCode
+}
+
+// extractToolInputs pulls the typical SWE-bench tool input fields
+// (path / command) out of an EventToolCallStart payload. Returns
+// empty strings when the field is missing or the payload is mis-
+// shaped — callers must tolerate that.
+func extractToolInputs(data any) (path, command string) {
+	m, ok := data.(map[string]any)
+	if !ok {
+		return "", ""
+	}
+	input, ok := m["input"].(map[string]any)
+	if !ok {
+		return "", ""
+	}
+	if s, ok := input["path"].(string); ok {
+		path = s
+	}
+	if s, ok := input["command"].(string); ok {
+		command = s
+	}
+	return path, command
 }
 
 // isWriteTool returns true for tools that produce a code-mutating
@@ -1188,15 +1253,15 @@ func extractIssueSymbols(prompt string) []string {
 }
 
 func buildNudgePrompt() string {
-	return buildNudgePromptWithSymbols(nil)
+	return buildNudgePromptWithSymbols(nil, "")
 }
 
 // buildNudgePromptWithSymbols renders the commit-now nudge with an
-// optional concrete list of issue symbols extracted from the prompt.
-// When the symbols are non-empty, they are inlined verbatim so the
-// agent has the exact strings to grep for and patch — much harder to
-// hallucinate a different bug than when only generic guidance is given.
-func buildNudgePromptWithSymbols(symbols []string) string {
+// optional concrete list of issue symbols extracted from the prompt
+// AND an optional file-hint (the most-frequently-read source file in
+// the trajectory so far). When both are present, the agent has nearly
+// zero ambiguity about WHERE to apply the fix.
+func buildNudgePromptWithSymbols(symbols []string, fileHint string) string {
 	symbolHint := ""
 	if len(symbols) > 0 {
 		quoted := make([]string, len(symbols))
@@ -1207,6 +1272,9 @@ func buildNudgePromptWithSymbols(symbols []string) string {
 			strings.Join(quoted, ", ") + ".\n" +
 			"Your patch MUST modify a file containing one of these symbols. " +
 			"Use ripgrep_search to confirm the symbol's location if you don't already know it.\n"
+	}
+	if fileHint != "" {
+		symbolHint += "Most-read file so far: `" + fileHint + "` — that is almost certainly your patch target.\n"
 	}
 	return "STOP. Your previous turn finished without producing patch.diff (or with patch.diff EMPTY — " +
 		"0 bytes) — that is an automatic 0.\n" +
@@ -1235,48 +1303,230 @@ func buildNudgePromptWithSymbols(symbols []string) string {
 		"No patch = no second chance. Commit now."
 }
 
+// extractMostReadSourceFile scans the workspace's `.agent/trajectory.jsonl`
+// and returns the most-frequently-read source path under `repo/`. Test
+// files are deliberately skipped — the issue is in the source tree, not
+// the test suite.
+//
+// Used by the nudge / commit-force prompts to inject a CONCRETE file
+// path the model has already invested attention in. v10 evidence:
+// astropy sample 1 read `repo/astropy/modeling/separable.py` 5+ times
+// without ever calling update_file. Saying "edit a file containing one
+// of these symbols" left the choice to the model; saying "edit
+// `repo/astropy/modeling/separable.py` (you've read this 5 times)"
+// removes the choice. The file the model already invested in is
+// almost certainly the right one.
+//
+// Returns "" when the trajectory has no read_file actions yet.
+func extractMostReadSourceFile(workDir string) string {
+	trajPath := filepath.Join(workDir, ".agent", "trajectory.jsonl")
+	f, err := os.Open(trajPath)
+	if err != nil {
+		return ""
+	}
+	defer f.Close()
+
+	counts := map[string]int{}
+	dec := json.NewDecoder(f)
+	for {
+		var raw json.RawMessage
+		if err := dec.Decode(&raw); err != nil {
+			break
+		}
+		var ev struct {
+			Kind     string `json:"kind"`
+			ToolName string `json:"toolName"`
+			Input    struct {
+				Path string `json:"path"`
+			} `json:"input"`
+		}
+		if err := json.Unmarshal(raw, &ev); err != nil {
+			continue
+		}
+		if ev.Kind != "action" || ev.ToolName != "read_file" {
+			continue
+		}
+		path := ev.Input.Path
+		if path == "" || !strings.HasPrefix(path, "repo/") {
+			continue
+		}
+		// Skip test files — the bug is in the source, not the test.
+		if strings.Contains(path, "/tests/") || strings.Contains(path, "/test/") {
+			continue
+		}
+		base := filepath.Base(path)
+		if strings.HasPrefix(base, "test_") || strings.HasSuffix(base, "_test.py") {
+			continue
+		}
+		counts[path]++
+	}
+	if len(counts) == 0 {
+		return ""
+	}
+	var best string
+	bestN := 0
+	for p, n := range counts {
+		if n > bestN || (n == bestN && p < best) {
+			bestN = n
+			best = p
+		}
+	}
+	return best
+}
+
+// classifyStage maps a single tool invocation to one of the seven
+// SWE-bench plan stages defined in the r2egym scaffold. Used by
+// runOneTurn to emit `plan_stage_enter` meta events so the SIBDD
+// classifier can build per-task stage profiles for the paper's
+// failure-mode analysis (§10.5.7 — eval-as-rollout supervision).
+//
+// Stages:
+//   1 ORIENT     — read plan.md, locate the workspace
+//   2 LOCATE     — find the target symbol (ast/glob/ripgrep)
+//   3 STUDY      — read source files in narrow ranges
+//   4 FIX        — update_file / create_file / remove_file
+//   5 REPRODUCE  — run_reproducer / run a reproducer script
+//   6 EDGE_CASES — additional reads after a fix (cross-checking)
+//   7 SAVE       — git diff --cached → patch.diff
+type planStage int
+
+const (
+	stageUnknown   planStage = 0
+	stageOrient    planStage = 1
+	stageLocate    planStage = 2
+	stageStudy     planStage = 3
+	stageFix       planStage = 4
+	stageReproduce planStage = 5
+	stageEdgeCases planStage = 6
+	stageSave      planStage = 7
+)
+
+func (s planStage) String() string {
+	switch s {
+	case stageOrient:
+		return "orient"
+	case stageLocate:
+		return "locate"
+	case stageStudy:
+		return "study"
+	case stageFix:
+		return "fix"
+	case stageReproduce:
+		return "reproduce"
+	case stageEdgeCases:
+		return "edge_cases"
+	case stageSave:
+		return "save"
+	}
+	return "unknown"
+}
+
+func classifyStage(toolName, path, command string, sawFix bool) planStage {
+	switch toolName {
+	case "update_file", "create_file", "remove_file":
+		return stageFix
+	case "run_reproducer":
+		return stageReproduce
+	case "ast_search", "ripgrep_search", "glob_search":
+		if sawFix {
+			return stageEdgeCases
+		}
+		return stageLocate
+	case "list_files":
+		if sawFix {
+			return stageEdgeCases
+		}
+		return stageLocate
+	case "read_file":
+		if strings.HasSuffix(path, "plan.md") {
+			return stageOrient
+		}
+		if sawFix {
+			return stageEdgeCases
+		}
+		return stageStudy
+	case "run_command":
+		if strings.Contains(command, "git diff") || strings.Contains(command, "git add") {
+			return stageSave
+		}
+		if sawFix {
+			return stageReproduce
+		}
+		return stageStudy
+	}
+	return stageUnknown
+}
+
 // buildCommitForcePrompt is the maximally-directive last-resort message
 // sent in BO@N's commit-force phase (paper §10.5.7) when both the agent
 // run and the nudge failed to produce a non-empty patch.diff.
 //
-// v9 evidence: even with correct symbol extraction in the nudge, the
-// model can read the right file 17 times without ever calling
-// update_file. This prompt removes ambiguity — your single next tool
-// call must be update_file, on a file containing one of the named
-// symbols. No exploration is allowed.
+// v11 changes: replaces the directive ("MUST be update_file") with
+// trigger-word + first-person priming. v10 evidence: even with the
+// directive prompt, the EKTO model defaulted to list_files / run_command
+// because the directive language pushed it into rule-following mode
+// rather than action mode. v11 substitutes:
+//   - First-person commitment seed ("I have enough context. I'll edit X")
+//   - Concrete file target (extractMostReadSourceFile result)
+//   - update_file format example (primes the call shape)
+//   - Strong commit verbs ("patch", "modify") matching R2E rollout
+//     trajectory style the EKTO model was trained on
 //
-// The prompt deliberately includes a fallback instruction ("if you
-// don't know what to fix, make ANY plausible edit") because for paper
-// purposes a wrong patch in a winning sample is still graded by the
-// critic and pytest gate, whereas no patch is an automatic 0.
-func buildCommitForcePrompt(symbols []string) string {
-	symbolBlock := ""
+// `fileHint` is the most-frequently-read source file in the agent's
+// trajectory so far — empty string when extraction yielded nothing,
+// in which case we fall back to symbol-only guidance.
+func buildCommitForcePrompt(symbols []string, fileHint string) string {
+	var b strings.Builder
+	b.WriteString("LAST CHANCE — no patch.diff yet (or it's 0 bytes). The conversation has gathered enough context; this turn is for committing the fix, not for further exploration.\n\n")
+
 	if len(symbols) > 0 {
 		quoted := make([]string, len(symbols))
 		for i, s := range symbols {
 			quoted[i] = "`" + s + "`"
 		}
-		symbolBlock = "\nIssue symbols (anchor your patch to one of these): " +
-			strings.Join(quoted, ", ") + "\n"
+		b.WriteString("Issue symbols (your patch must touch a file containing one of these): " +
+			strings.Join(quoted, ", ") + "\n")
 	}
-	return "LAST CHANCE. The conversation has produced no patch.diff (or a 0-byte one). " +
-		"This is the commit-force phase — your ONE remaining tool call must be `update_file`.\n" +
-		symbolBlock +
-		"\n" +
-		"Hard constraints for this turn:\n" +
-		"1. Your next tool call MUST be `update_file`. NOT ast_search, NOT read_file, NOT ripgrep_search, " +
-		"NOT run_command. Just one update_file.\n" +
-		"2. The path you pass to update_file MUST be `repo/<...>` (not absolute, not bare).\n" +
-		"3. Edit a file containing one of the issue symbols listed above. You have already read enough; " +
-		"pick the most plausible target from the files you have seen.\n" +
-		"4. After update_file, immediately call `run_command` once to save patch.diff:\n" +
-		"   `cd repo && git add -A && git diff --cached > ../patch.diff && git restore --staged .`\n" +
-		"\n" +
-		"Decision rule: a wrong-but-plausible patch is graded by the critic and pytest gate and may " +
-		"earn partial credit. NO patch is an automatic 0. If you're unsure of the exact fix, " +
-		"choose the smallest minimal-impact edit you can defend (e.g. add the obvious recursion case, " +
-		"add the missing branch, fix the most-suspect line) and let the verifier decide. " +
-		"Don't keep exploring."
+	if fileHint != "" {
+		b.WriteString("Most-read source file in this conversation: `" + fileHint + "`. " +
+			"That is your patch target unless you have a stronger reason to pick a different file.\n")
+	}
+	b.WriteString("\n")
+
+	// First-person priming: seed the model's response so it completes
+	// the pattern (commit) instead of restarting (explore).
+	if fileHint != "" {
+		b.WriteString("Begin your next response with this exact sentence (then continue normally):\n")
+		b.WriteString("    \"I have enough context. I'll patch `" + fileHint + "` now to fix the issue.\"\n\n")
+	} else {
+		b.WriteString("Begin your next response with: \"I have enough context. I'll apply the fix now.\"\n\n")
+	}
+
+	// Format example primes the tool call shape.
+	b.WriteString("Then call update_file in this exact shape:\n")
+	b.WriteString("    update_file(\n")
+	if fileHint != "" {
+		b.WriteString("      path=\"" + fileHint + "\",\n")
+	} else {
+		b.WriteString("      path=\"repo/<package>/<module>.py\",\n")
+	}
+	b.WriteString("      old_string=\"<the line(s) you're replacing — must match exactly>\",\n")
+	b.WriteString("      new_string=\"<the fixed line(s)>\"\n")
+	b.WriteString("    )\n\n")
+
+	b.WriteString("Then call run_command exactly once to save the patch:\n")
+	b.WriteString("    run_command(\"cd repo && git add -A && git diff --cached > ../patch.diff && git restore --staged .\")\n\n")
+
+	// Forbidden tools — the model needs an explicit avoid-list.
+	b.WriteString("Forbidden this turn: `ast_search`, `read_file`, `ripgrep_search`, `glob_search`, `list_files`. You already have all the context you need; calling them again is the failure mode that brought us here.\n\n")
+
+	// Decision rule + safety net.
+	b.WriteString("If the exact edit is uncertain: make the smallest plausible patch that touches the symbol named in the issue. Common minimal fixes that often work:\n")
+	b.WriteString("  - add the missing recursion case to the function named in the issue\n")
+	b.WriteString("  - add the missing branch / guard for the input shape the issue describes\n")
+	b.WriteString("  - flip the boolean operator on the most-suspect comparison\n\n")
+	b.WriteString("A wrong patch is graded by critic + pytest and can earn partial credit. NO patch = automatic 0. The verifier decides correctness; this turn is for committing.")
+	return b.String()
 }
 
 // buildRevisePrompt wraps the critic verdict so the agent can act on it.

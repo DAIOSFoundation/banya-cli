@@ -188,17 +188,25 @@ func runBoN(
 		// sample hit timeout (exitCode 2) — exactly the case where the
 		// commit-now nudge has the highest leverage. Sidecar errors (3) are
 		// still excluded because the chat session itself is unhealthy.
+		// Extract the most-read source file from this sample's
+		// trajectory so far — used to inject a concrete patch target
+		// into both nudge and commit-force prompts (v11). Empty
+		// string when the agent did no read_file calls; both prompts
+		// fall back to symbol-only guidance in that case.
+		fileHint := extractMostReadSourceFile(workDir)
+
 		if !noPatchNudge && exitCode != 3 && !patchExistsAt(patchPath) {
 			emitMeta(out, map[string]any{
 				"phase":           "swe_bo_n_nudge",
 				"index":           i,
 				"after_exit_code": exitCode,
 				"issue_symbols":   issueSymbols,
+				"file_hint":       fileHint,
 				"session_id":      sessionID,
 			})
 			_, _, _ = runOneTurn(out, pc, protocol.ChatRequest{
 				SessionID:  fmt.Sprintf("%s-bo%d", sessionID, i),
-				Message:    buildNudgePromptWithSymbols(issueSymbols),
+				Message:    buildNudgePromptWithSymbols(issueSymbols, fileHint),
 				WorkDir:    workDir,
 				PromptType: protocol.PromptType(samplePromptType),
 			}, nudgeTimeout, idleAbort, thinkingAbort, autoApprove)
@@ -209,15 +217,16 @@ func runBoN(
 		}
 
 		// C2. Commit-force (paper §10.5.7 commit scaffold) — when even
-		// the nudge produced no patch, run one more turn with a maximally
-		// directive prompt that tells the agent its NEXT tool call MUST
-		// be update_file. Short timeout (half of nudgeTimeout, capped at
-		// 600s) so we don't burn budget on a non-committing model.
+		// the nudge produced no patch, run one more turn with a
+		// trigger-word + first-person + concrete-file prompt that
+		// primes the model to commit instead of explore (v11). Short
+		// timeout (half of nudgeTimeout, capped at 600s) so we don't
+		// burn budget on a non-committing model.
 		//
-		// v9 evidence (astropy-12907): sample 1 produced 17 read/search
-		// actions on the correct file (separable.py) but never reached
-		// update_file before per-sample timeout. The plain nudge gives
-		// the agent freedom; commit-force removes it.
+		// v10 evidence (astropy-12907): even with the directive
+		// "Your next tool call MUST be update_file", the EKTO model
+		// defaulted to list_files / run_command. v11 swaps directive
+		// for first-person trigger-word priming + concrete file path.
 		if !noPatchNudge && exitCode != 3 && !patchExistsAt(patchPath) {
 			cfTimeout := nudgeTimeout / 2
 			if cfTimeout > 600*time.Second {
@@ -226,16 +235,20 @@ func runBoN(
 			if cfTimeout < 60*time.Second {
 				cfTimeout = 60 * time.Second
 			}
+			// Re-extract fileHint — the nudge phase may have added
+			// fresh reads that change the most-read target.
+			fileHint = extractMostReadSourceFile(workDir)
 			emitMeta(out, map[string]any{
 				"phase":         "swe_bo_n_commit_force",
 				"index":         i,
 				"issue_symbols": issueSymbols,
+				"file_hint":     fileHint,
 				"timeout_s":     int(cfTimeout.Seconds()),
 				"session_id":    sessionID,
 			})
 			_, _, _ = runOneTurn(out, pc, protocol.ChatRequest{
 				SessionID:  fmt.Sprintf("%s-bo%d", sessionID, i),
-				Message:    buildCommitForcePrompt(issueSymbols),
+				Message:    buildCommitForcePrompt(issueSymbols, fileHint),
 				WorkDir:    workDir,
 				PromptType: protocol.PromptType(samplePromptType),
 			}, cfTimeout, idleAbort, thinkingAbort, autoApprove)
