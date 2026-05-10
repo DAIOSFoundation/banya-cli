@@ -492,6 +492,46 @@ func runHeadless(cmd *cobra.Command, _ []string) error {
 		refreshPatchDiff(workDir, out)
 	}
 
+	// v18.6 — second-chance Diff Linter. The original nudge fires once.
+	// v18.5 evidence (matplotlib): after the first nudge, the model
+	// produced a patch.diff containing ONLY fabricated test files
+	// (final_test.py, issue_example.py, test_comprehensive.py) — all
+	// sandbox per isSandboxPath, but Diff Linter never re-checked
+	// because nudgedThisRun was already true. Submitted patch was
+	// effectively a reproducer-only artefact.
+	//
+	// Second-chance fires when ALL of:
+	//   - main nudge already fired (nudgedThisRun==true, so the model
+	//     had a chance and squandered it on tests)
+	//   - patch exists AND every file is sandbox classification
+	//   - exit isn't a chat-start error (sidecar still alive)
+	// Builds a stronger commit-force-style prompt that explicitly
+	// names "no more test files; modify the source file under repo/".
+	if !wbLayout.Active() && !noPatchNudge && nudgedThisRun && exitCode != 3 &&
+		patchExists() && patchHasOnlySandboxFiles(patchPath) {
+		issueSymbols := extractIssueSymbols(promptText)
+		fileHint := extractMostReadSourceFileValidated(workDir, issueSymbols)
+		emitMeta(out, map[string]any{
+			"phase":              "nudge_second_chance",
+			"reason":             "post_nudge_sandbox_only",
+			"issue_symbols":      issueSymbols,
+			"file_hint":          fileHint,
+			"session_id":         sessionID,
+			"patch_only_sandbox": true,
+		})
+		// Use buildCommitForcePrompt with reproducerOnly=true to get
+		// the "LAST CHANCE — your patch.diff only modifies reproducer
+		// / test / workspace files" framing that's stronger than the
+		// regular nudge prompt.
+		_, exitReason, exitCode = runOneTurn(out, pc, protocol.ChatRequest{
+			SessionID:  sessionID,
+			Message:    buildCommitForcePrompt(issueSymbols, fileHint, true),
+			WorkDir:    workDir,
+			PromptType: protocol.PromptType(promptTypeStr),
+		}, nudgeTimeout/2, idleAbort, thinkingAbort, autoApprove)
+		refreshPatchDiff(workDir, out)
+	}
+
 	// Critic phase — up to `criticMaxRounds` review→revise cycles. Stops
 	// early on: (a) critic OK, (b) revise turn errored, (c) patch did not
 	// change between rounds (agent stuck). Gated on non-webbench layout
@@ -1624,7 +1664,12 @@ func extractMostReadSourceFileValidated(workDir string, issueSymbols []string) s
 		if !filepath.IsAbs(absPath) {
 			absPath = filepath.Join(workDir, absPath)
 		}
-		if fileContainsAnySymbol(absPath, issueSymbols) {
+		// v18.6 — prefer files that DEFINE a symbol over files that
+		// merely reference one. v18.5 evidence (astropy v18.4 fileHint
+		// = `core.py` because `from .separable import separability_matrix`
+		// is a substring match): substring validation passes import
+		// lines too, locking the model onto the wrong file.
+		if fileDefinesAnySymbol(absPath, issueSymbols) {
 			return cands[i].path
 		}
 	}
@@ -1634,12 +1679,7 @@ func extractMostReadSourceFileValidated(workDir string, issueSymbols []string) s
 
 // fileContainsAnySymbol returns true when `path` is readable and
 // contains at least one of the symbols as a substring. Cheap byte
-// match — does not need to be a full word boundary check; false
-// positives (substring match in comments / docstrings) are tolerable
-// because the worst case degrades to legacy fileHint behaviour.
-//
-// Returns false on read errors (unreadable / very large files >2MB)
-// to keep the validator from blocking on edge cases.
+// match. Kept for backwards compat / non-Python files.
 func fileContainsAnySymbol(path string, symbols []string) bool {
 	st, err := os.Stat(path)
 	if err != nil || st.Size() > 2*1024*1024 {
@@ -1652,6 +1692,55 @@ func fileContainsAnySymbol(path string, symbols []string) bool {
 	body := string(data)
 	for _, s := range symbols {
 		if s != "" && strings.Contains(body, s) {
+			return true
+		}
+	}
+	return false
+}
+
+// fileDefinesAnySymbol is v18.6's stricter validator. Returns true
+// only if the file contains a *definition* (class def, function def,
+// or top-level assignment) for any of the symbols. Substring matches
+// inside import lines, comments, docstrings, or other-file references
+// do NOT count.
+//
+// v18.5 astropy evidence: `core.py` matched `separability_matrix` via
+// the `from .separable import separability_matrix` import line. The
+// model patched core.py instead of separable.py (where the symbol is
+// actually defined). Definition-level matching catches this.
+//
+// Patterns matched (Python multi-line, ^ anchored to line start):
+//   - `class <NAME>` / `class <NAME>:` / `class <NAME>(` (class def)
+//   - `def <NAME>(` (function/method def)
+//   - `<NAME> = ` at column 0 (top-level assignment / constant)
+//
+// Returns false on read errors / very large files (>2MB) — falls back
+// to the legacy substring path in that case via the caller.
+func fileDefinesAnySymbol(path string, symbols []string) bool {
+	st, err := os.Stat(path)
+	if err != nil || st.Size() > 2*1024*1024 {
+		return false
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return false
+	}
+	body := string(data)
+	for _, s := range symbols {
+		if s == "" {
+			continue
+		}
+		quoted := regexp.QuoteMeta(s)
+		// class def: `class NAME` followed by `:`, `(`, or space
+		// (?m): multiline, ^ matches start of any line
+		patClass := regexp.MustCompile(`(?m)^\s*class\s+` + quoted + `\b`)
+		patFunc := regexp.MustCompile(`(?m)^\s*(async\s+)?def\s+` + quoted + `\s*\(`)
+		// Top-level assignment: NAME at column 0 (no leading whitespace)
+		// followed by optional type annotation and `=`. Catches:
+		//   FILE_UPLOAD_PERMISSIONS = None
+		//   version_info: tuple = (3, 7, 1)
+		patAssign := regexp.MustCompile(`(?m)^` + quoted + `\s*(:[^=]+)?\s*=`)
+		if patClass.MatchString(body) || patFunc.MatchString(body) || patAssign.MatchString(body) {
 			return true
 		}
 	}
