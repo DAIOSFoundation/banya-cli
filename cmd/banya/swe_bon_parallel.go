@@ -368,6 +368,30 @@ func runBoNViaChildren(
 					"session_id": sessionID,
 				})
 			}
+
+			// v18.7 — also preserve the loser's patch.diff for best-of-N
+			// hidden-test diagnostics (Diagnostic D). Without this, the
+			// teardownSampleWorktree call below wipes <sampleDir>/repo/
+			// AND the auxiliary patch.diff at <sampleDir>/patch.diff.
+			// SIBDD pipeline / hidden-test grading on all N samples
+			// requires every child's patch — not just the winner's.
+			//
+			// Copies <sampleDir>/patch.diff → <workDir>/.agent/patch.bo<i>.diff
+			// when the file exists and is non-empty. Best-effort: missing
+			// or empty patches are silently skipped.
+			patchSrc := filepath.Join(sampleDirs[r.idx], "patch.diff")
+			if st, err := os.Stat(patchSrc); err == nil && st.Size() > 0 {
+				patchDst := filepath.Join(workDir, ".agent", fmt.Sprintf("patch.bo%d.diff", r.idx))
+				if err := copyFileForBackup(patchSrc, patchDst); err == nil {
+					emit(map[string]any{
+						"phase":      "swe_bo_n_patch_backup",
+						"index":      r.idx,
+						"path":       patchDst,
+						"size":       st.Size(),
+						"session_id": sessionID,
+					})
+				}
+			}
 		}
 
 		// Also copy the child's stdout.jsonl into .agent for debugging.
