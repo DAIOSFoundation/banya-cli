@@ -197,6 +197,12 @@ func runBoNViaChildren(
 	// Force --swe-bo-n 1 in the child so it skips the BO@N branch and
 	// runs run.go's regular flow (agent → nudge → critic → pytest).
 	childArgs = injectBoNOne(childArgs)
+	// Force --timeout to match sequential BO@N's per-sample budget.
+	// Without this, child uses banya-cli's 600s default (HALF of
+	// sequential), times out in the middle of long agent loops.
+	// Astropy needs ~2000s per BO@N sample; we use perChildTimeout
+	// directly which already includes effectiveTimeout + nudgeTimeout.
+	childArgs = injectTimeout(childArgs, perChildTimeout)
 
 	startedAt := time.Now()
 	for i := 0; i < n; i++ {
@@ -437,6 +443,38 @@ func injectBoNOne(args []string) []string {
 		out = append(out, a)
 	}
 	out = append(out, "--swe-bo-n", "1")
+	return out
+}
+
+// injectTimeout ensures the child uses a generous per-turn `--timeout`
+// instead of the banya-cli default (600s, which is half of what
+// sequential BO@N's per-sample-timeout uses). Without this fix,
+// child banya-cli running run.go's regular flow would hit per-turn
+// timeout in the middle of long agent loops (observed empirically:
+// astropy v18.2 child timed out at 35min while sequential v18
+// astropy needed 67min to finish).
+//
+// Strips any existing `--timeout <D>` pair (or `--timeout=D` form)
+// and appends the corrected one. The format must be a duration string
+// (e.g., `1200s`) parseable by Cobra's GetDuration.
+func injectTimeout(args []string, timeout time.Duration) []string {
+	out := make([]string, 0, len(args)+2)
+	skipNext := false
+	for _, a := range args {
+		if skipNext {
+			skipNext = false
+			continue
+		}
+		if a == "--timeout" {
+			skipNext = true
+			continue
+		}
+		if strings.HasPrefix(a, "--timeout=") {
+			continue
+		}
+		out = append(out, a)
+	}
+	out = append(out, "--timeout", timeout.String())
 	return out
 }
 

@@ -142,11 +142,24 @@ func runBoN(
 	if parallelEnabled && !isChild && n > 1 {
 		// Honour BANYA_SWE_BO_KEEP_LOSERS the same way sequential does.
 		keepLosers := os.Getenv("BANYA_SWE_BO_KEEP_LOSERS") == "1"
+		// Per-child wallclock cap = 2× per-sample timeout + nudgeTimeout.
+		// Sequential BO@N budgets per-sample = effectiveTimeout for the
+		// MAIN agent run + auxiliary turns (nudge, critic-revise×N,
+		// pytest-revise) each with their own short timeouts. Empirically
+		// astropy needed ~2000s per sample (sequential v18 took 4059s
+		// total / 2 samples). We give the child 2× effectiveTimeout +
+		// nudgeTimeout so all BO@N phases fit comfortably.
+		perChildCap := effectiveTimeout*2 + nudgeTimeout
+		// Hard cap at the parent's overall task timeout (it doesn't help
+		// to give a child more time than the parent has).
+		if perChildCap > timeout {
+			perChildCap = timeout
+		}
 		return runBoNViaChildren(
 			ctx, out, sessionID,
 			workDir, patchPath,
 			n, tempMin, tempMax,
-			effectiveTimeout+nudgeTimeout, // generous per-child wallclock cap
+			perChildCap,
 			keepLosers,
 		)
 	}
