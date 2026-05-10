@@ -150,10 +150,19 @@ func runBoN(
 		// total / 2 samples). We give the child 2× effectiveTimeout +
 		// nudgeTimeout so all BO@N phases fit comfortably.
 		perChildCap := effectiveTimeout*2 + nudgeTimeout
-		// Hard cap at the parent's overall task timeout (it doesn't help
-		// to give a child more time than the parent has).
-		if perChildCap > timeout {
-			perChildCap = timeout
+		// Hard cap at parent's overall task timeout MINUS a 120s graceful
+		// shutdown buffer. v18.4 evidence (astropy bo1): when perChildCap
+		// equalled parent's timeout, parent (and children) got SIGKILL'd
+		// at the same moment — child never got a chance to write bo_meta.json,
+		// so the parent's runBoNViaChildren saw has_patch=false and chose
+		// no_winner, throwing away a valid 2929B in-progress patch.
+		// The 120s buffer gives children enough headroom to:
+		//   1. observe their context.WithTimeout firing (cleanly aborts runOneTurn)
+		//   2. run the deferred bo_meta.json write in run.go
+		//   3. let parent's reader collect bo_meta.json before SIGKILL
+		const childShutdownBuffer = 120 * time.Second
+		if timeout > childShutdownBuffer && perChildCap > timeout-childShutdownBuffer {
+			perChildCap = timeout - childShutdownBuffer
 		}
 		return runBoNViaChildren(
 			ctx, out, sessionID,

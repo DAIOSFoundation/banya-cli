@@ -1298,24 +1298,19 @@ func extractIssueSymbols(prompt string) []string {
 		// the blocklist + git-hash filter to catch obvious noise.
 		target = prompt
 	}
-	// Match `<identifier>` where identifier is a Python-style name,
-	// optionally with a trailing `()` to capture method invocations.
-	re := regexp.MustCompile("`([A-Za-z_][A-Za-z0-9_]{1,80})(\\(\\))?`")
-	matches := re.FindAllStringSubmatch(target, -1)
-	if len(matches) == 0 {
-		return nil
-	}
-	// Frequency-rank: the more often the issue mentions a name, the
-	// more central it likely is to the bug.
+	// Primary pass: match `<identifier>` (backtick-quoted), optionally with
+	// a trailing `()` to capture method invocations. This is the high-
+	// precision path — if the issue body explicitly emphasises a symbol
+	// in backticks, prefer those.
+	reBacktick := regexp.MustCompile("`([A-Za-z_][A-Za-z0-9_]{1,80})(\\(\\))?`")
+	matches := reBacktick.FindAllStringSubmatch(target, -1)
+
 	counts := map[string]int{}
 	for _, m := range matches {
 		name := m[1]
-		// Skip common false positives — Python keywords, very short
-		// fragments, and pure-digit identifiers.
 		if len(name) < 3 {
 			continue
 		}
-		// Reject scaffold/tool names + git hashes (v9 lesson).
 		if nonIssueSymbolBlocklist[name] {
 			continue
 		}
@@ -1324,6 +1319,69 @@ func extractIssueSymbols(prompt string) []string {
 		}
 		counts[name]++
 	}
+
+	// v18.5 — Fallback for plain-text issues. v18.4 evidence:
+	// django ("Set default FILE_UPLOAD_PERMISSION to 0o644") and flask
+	// ("Raise error when blueprint name contains a dot") use plain-text
+	// identifiers without backticks. The backtick-only regex returned
+	// nil, leaving nudge/commit-force prompts without symbol context.
+	// When the primary pass yielded zero hits, scan for "bug-shaped"
+	// identifiers — names that have at least one of: an underscore, an
+	// ALL-CAPS prefix of length >= 3, or CamelCase (capital + lowercase
+	// + capital). This filter excludes English prose words like "would",
+	// "default", "permissions" while catching FILE_UPLOAD_PERMISSION,
+	// FileSystemStorage, Blueprint, etc.
+	if len(counts) == 0 {
+		reBare := regexp.MustCompile("[A-Za-z_][A-Za-z0-9_]{2,80}")
+		// Pre-compiled identifier "shape" tests.
+		hasUnderscore := func(s string) bool { return strings.ContainsAny(s, "_") }
+		isAllCapsPrefix := func(s string) bool {
+			if len(s) < 3 {
+				return false
+			}
+			caps := 0
+			for _, r := range s {
+				if r >= 'A' && r <= 'Z' {
+					caps++
+				} else {
+					break
+				}
+			}
+			return caps >= 3
+		}
+		isCamelCase := func(s string) bool {
+			if len(s) < 4 || s[0] < 'A' || s[0] > 'Z' {
+				return false
+			}
+			hasLower := false
+			hasInnerCap := false
+			for i := 1; i < len(s); i++ {
+				c := s[i]
+				if c >= 'a' && c <= 'z' {
+					hasLower = true
+				} else if c >= 'A' && c <= 'Z' && hasLower {
+					hasInnerCap = true
+				}
+			}
+			return hasInnerCap
+		}
+		for _, name := range reBare.FindAllString(target, -1) {
+			if len(name) < 4 {
+				continue
+			}
+			if !hasUnderscore(name) && !isAllCapsPrefix(name) && !isCamelCase(name) {
+				continue
+			}
+			if nonIssueSymbolBlocklist[name] {
+				continue
+			}
+			if gitHashRe.MatchString(name) {
+				continue
+			}
+			counts[name]++
+		}
+	}
+
 	if len(counts) == 0 {
 		return nil
 	}
