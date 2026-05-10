@@ -469,6 +469,45 @@ func runHeadless(cmd *cobra.Command, _ []string) error {
 	var childPytestRan, childPytestPass, childPytestRevised bool
 	childStartedAt := time.Now()
 
+	// v18.6 fix #5 — incremental bo_meta.json snapshot helper. Called at
+	// each phase boundary so that even if the child gets SIGKILL'd in a
+	// later phase (parent timeout, OOM, panic), the parent's reader sees
+	// the latest known state instead of treating has_patch=false. Critical
+	// for SIBDD forensics: v18.5 astropy bo0 evidence — 117KB log, 42 actions
+	// of in-progress work was thrown away because the child died before
+	// reaching the final bo_meta write at exit.
+	//
+	// Each call overwrites bo_meta.json with the current snapshot of all
+	// per-phase signals. Best-effort — failures are logged and don't abort.
+	snapshotBoMeta := func() {
+		if !isBoNChild {
+			return
+		}
+		hasPatch := patchExists()
+		var patchHash string
+		if hasPatch {
+			if data, err := os.ReadFile(patchPath); err == nil {
+				h := sha1.Sum(data)
+				patchHash = hex.EncodeToString(h[:])[:12]
+			}
+		}
+		_ = writeBoChildMeta(out, workDir, boChildMeta{
+			Index:         childIndex,
+			HasPatch:      hasPatch,
+			PatchHash:     patchHash,
+			PatchPath:     patchPath,
+			NudgeFired:    nudgedThisRun,
+			CommitForced:  false,
+			CriticRan:     childCriticRan,
+			CriticOK:      childCriticOK,
+			CriticRevised: childCriticRevised,
+			PytestRan:     childPytestRan,
+			PytestPass:    childPytestPass,
+			PytestRevised: childPytestRevised,
+			WallElapsedS:  int(time.Since(childStartedAt).Seconds()),
+		})
+	}
+
 	reproducerOnlyAtTopNudge := patchHasOnlySandboxFiles(patchPath)
 	if !wbLayout.Active() && !noPatchNudge && !nudgedThisRun && exitCode != 3 && (!patchExists() || reproducerOnlyAtTopNudge) {
 		nudgedThisRun = true
@@ -490,6 +529,7 @@ func runHeadless(cmd *cobra.Command, _ []string) error {
 			PromptType: protocol.PromptType(promptTypeStr),
 		}, nudgeTimeout, idleAbort, thinkingAbort, autoApprove)
 		refreshPatchDiff(workDir, out)
+		snapshotBoMeta() // v18.6 fix #5 — checkpoint after nudge phase
 	}
 
 	// v18.6 — second-chance Diff Linter. The original nudge fires once.
@@ -530,6 +570,7 @@ func runHeadless(cmd *cobra.Command, _ []string) error {
 			PromptType: protocol.PromptType(promptTypeStr),
 		}, nudgeTimeout/2, idleAbort, thinkingAbort, autoApprove)
 		refreshPatchDiff(workDir, out)
+		snapshotBoMeta() // v18.6 fix #5 — checkpoint after second-chance Diff Linter
 	}
 
 	// Critic phase — up to `criticMaxRounds` review→revise cycles. Stops
@@ -599,6 +640,7 @@ func runHeadless(cmd *cobra.Command, _ []string) error {
 				}, timeout, idleAbort, thinkingAbort, autoApprove)
 				refreshPatchDiff(workDir, out)
 				childCriticRevised = true
+				snapshotBoMeta() // v18.6 fix #5 — checkpoint after critic-revise
 				if exitCode != 0 || !patchExists() {
 					break
 				}
@@ -653,6 +695,7 @@ func runHeadless(cmd *cobra.Command, _ []string) error {
 				}, timeout, idleAbort, thinkingAbort, autoApprove)
 				refreshPatchDiff(workDir, out)
 				childPytestRevised = true
+				snapshotBoMeta() // v18.6 fix #5 — checkpoint after pytest-revise
 				if exitCode == 0 && patchExists() {
 					pCtx2, pCancel2 := context.WithTimeout(cmd.Context(), time.Duration(swePytestTimeout)*time.Second)
 					pytestPassed2, _ := runProjectPytest(pCtx2, workDir, pytestTestFiles, swePytestTimeout)
@@ -674,6 +717,7 @@ func runHeadless(cmd *cobra.Command, _ []string) error {
 				"session_id":    sessionID,
 			})
 		}
+		snapshotBoMeta() // v18.6 fix #5 — checkpoint after pytest gate
 	}
 
 	// v2 Parallel B — child mode: emit bo_meta.json so the parent can
@@ -1305,6 +1349,28 @@ var nonIssueSymbolBlocklist = map[string]bool{
 	// (above) is the primary defence; this list is the safety net for
 	// the fallback path.
 	"_cstack": true, "Table.to_pandas": true, "unresolved": true,
+	// v18.6 — Platform / OS / hosting names that surface in SWE-bench
+	// issue bodies (often as bug-environment context: "I'm on CentOS",
+	// "see this Stack Overflow thread"). The bare-identifier regex
+	// fallback (v18.5) catches these as CamelCase candidates, but
+	// they're never the symbol the patch should target. v18.5 django
+	// evidence: issueSymbols included "CentOS" and "GitHub" alongside
+	// the actual bug symbols (FILE_UPLOAD_PERMISSION, FileSystemStorage),
+	// polluting the nudge prompt's symbol list.
+	"CentOS": true, "Ubuntu": true, "Debian": true, "RedHat": true,
+	"Fedora": true, "Arch": true, "Linux": true, "Windows": true,
+	"MacOS": true, "macOS": true, "Darwin": true, "BSD": true,
+	"FreeBSD": true, "OpenBSD": true, "Alpine": true, "NixOS": true,
+	"GitHub": true, "GitLab": true, "Bitbucket": true, "SourceForge": true,
+	"StackOverflow": true, "Stack": true, "Overflow": true,
+	"Reddit": true, "Twitter": true, "Discord": true, "Slack": true,
+	"Docker": true, "Kubernetes": true, "VSCode": true, "PyCharm": true,
+	"IntelliJ": true, "Sublime": true, "Vim": true, "Emacs": true,
+	// Common version control / CI identifiers in prose.
+	"CI": true, "CD": true, "PR": true, "MR": true, "API": true,
+	"URL": true, "URI": true, "HTTP": true, "HTTPS": true,
+	// Issue-tracker conventions.
+	"TODO": true, "FIXME": true, "XXX": true, "NOTE": true,
 }
 
 var gitHashRe = regexp.MustCompile(`^[a-f0-9]{7,40}$`)
