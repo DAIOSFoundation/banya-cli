@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/cascadecodes/banya-cli/internal/client"
@@ -195,23 +196,32 @@ func runBoN(
 		// fall back to symbol-only guidance in that case.
 		fileHint := extractMostReadSourceFile(workDir)
 
-		if !noPatchNudge && exitCode != 3 && !patchExistsAt(patchPath) {
+		// v18 — Diff Linter: also re-fire nudge when the patch exists
+		// but only touches reproducer/test/workspace files (the
+		// "Reproducer-only Artefact" terminal-attractor we saw in
+		// matplotlib v16 + django v16). Without this, a 0-byte source
+		// diff that happens to include `repro.py` passes the original
+		// gate and locks in score=0.
+		patchOnlySandbox := patchHasOnlySandboxFiles(patchPath)
+		if !noPatchNudge && exitCode != 3 && (!patchExistsAt(patchPath) || patchOnlySandbox) {
 			emitMeta(out, map[string]any{
-				"phase":           "swe_bo_n_nudge",
-				"index":           i,
-				"after_exit_code": exitCode,
-				"issue_symbols":   issueSymbols,
-				"file_hint":       fileHint,
-				"session_id":      sessionID,
+				"phase":              "swe_bo_n_nudge",
+				"index":              i,
+				"after_exit_code":    exitCode,
+				"issue_symbols":      issueSymbols,
+				"file_hint":          fileHint,
+				"session_id":         sessionID,
+				"reason":             ternStr(patchOnlySandbox, "reproducer_only", "empty"),
+				"patch_only_sandbox": patchOnlySandbox,
 			})
 			_, _, _ = runOneTurn(out, pc, protocol.ChatRequest{
 				SessionID:  fmt.Sprintf("%s-bo%d", sessionID, i),
-				Message:    buildNudgePromptWithSymbols(issueSymbols, fileHint),
+				Message:    buildNudgePromptWithSymbols(issueSymbols, fileHint, patchOnlySandbox),
 				WorkDir:    workDir,
 				PromptType: protocol.PromptType(samplePromptType),
 			}, nudgeTimeout, idleAbort, thinkingAbort, autoApprove)
 			refreshPatchDiff(workDir, out)
-			if patchExistsAt(patchPath) {
+			if patchExistsAt(patchPath) && !patchHasOnlySandboxFiles(patchPath) {
 				c.NudgeFired = true
 			}
 		}
@@ -227,7 +237,9 @@ func runBoN(
 		// "Your next tool call MUST be update_file", the EKTO model
 		// defaulted to list_files / run_command. v11 swaps directive
 		// for first-person trigger-word priming + concrete file path.
-		if !noPatchNudge && exitCode != 3 && !patchExistsAt(patchPath) {
+		// v18 — same Diff Linter gate as nudge phase.
+		patchOnlySandboxCF := patchHasOnlySandboxFiles(patchPath)
+		if !noPatchNudge && exitCode != 3 && (!patchExistsAt(patchPath) || patchOnlySandboxCF) {
 			cfTimeout := nudgeTimeout / 2
 			if cfTimeout > 600*time.Second {
 				cfTimeout = 600 * time.Second
@@ -239,21 +251,23 @@ func runBoN(
 			// fresh reads that change the most-read target.
 			fileHint = extractMostReadSourceFile(workDir)
 			emitMeta(out, map[string]any{
-				"phase":         "swe_bo_n_commit_force",
-				"index":         i,
-				"issue_symbols": issueSymbols,
-				"file_hint":     fileHint,
-				"timeout_s":     int(cfTimeout.Seconds()),
-				"session_id":    sessionID,
+				"phase":              "swe_bo_n_commit_force",
+				"index":              i,
+				"issue_symbols":      issueSymbols,
+				"file_hint":          fileHint,
+				"timeout_s":          int(cfTimeout.Seconds()),
+				"session_id":         sessionID,
+				"reason":             ternStr(patchOnlySandboxCF, "reproducer_only", "empty"),
+				"patch_only_sandbox": patchOnlySandboxCF,
 			})
 			_, _, _ = runOneTurn(out, pc, protocol.ChatRequest{
 				SessionID:  fmt.Sprintf("%s-bo%d", sessionID, i),
-				Message:    buildCommitForcePrompt(issueSymbols, fileHint),
+				Message:    buildCommitForcePrompt(issueSymbols, fileHint, patchOnlySandboxCF),
 				WorkDir:    workDir,
 				PromptType: protocol.PromptType(samplePromptType),
 			}, cfTimeout, idleAbort, thinkingAbort, autoApprove)
 			refreshPatchDiff(workDir, out)
-			if patchExistsAt(patchPath) {
+			if patchExistsAt(patchPath) && !patchHasOnlySandboxFiles(patchPath) {
 				c.CommitForced = true
 			}
 		}
@@ -486,6 +500,83 @@ func patchExistsAt(p string) bool {
 		return false
 	}
 	return st.Size() > 0
+}
+
+// patchHasOnlySandboxFiles returns true when patch.diff exists and is
+// non-empty BUT every file it touches is a reproducer / test / workspace
+// scratch file rather than a real source-tree edit.
+//
+// v18 (paper §9.7 follow-up — "Reproducer-only Artefact" terminal-attractor
+// finding from v16 matplotlib + django): the forced-commit phase + create-
+// reproducer step in the scaffold form a behavioural sink. Whatever
+// upstream failure happens (Localization / Mutation / Edit-Avoidance), the
+// agent's "I should commit something" subroutine fires → it creates
+// repro.py + runs git diff → patch.diff captures only repro.py. The hidden
+// test grader applies the patch and gets … a new repro.py at workspace
+// root, source untouched, hidden test still fails (score 0).
+//
+// The Diff Linter treats reproducer-only patches the same as empty
+// patches for nudge / commit-force gating, so the agent gets one more
+// chance to write a real source edit instead of accepting the sink.
+//
+// Sandbox-file heuristic:
+//   - basenames `repro.py`, `reproduce_issue.py`, `patch.diff`, `plan.md`
+//   - basenames matching `repro_*.py`
+//   - test paths under `/tests/` or `/test/`, or `test_*.py` / `*_test.py`
+//   - any path NOT under `repo/` (workspace scratch files)
+//
+// Returns false when the patch touches at least one real source file under
+// `repo/` (other than the heuristics above) — that's a real edit, even if
+// it's wrong, and the regular flow handles it.
+func patchHasOnlySandboxFiles(patchPath string) bool {
+	if !patchExistsAt(patchPath) {
+		return false
+	}
+	files := extractPatchedFiles(patchPath)
+	if len(files) == 0 {
+		return false
+	}
+	for _, p := range files {
+		if !isSandboxPath(p) {
+			return false
+		}
+	}
+	return true
+}
+
+func isSandboxPath(p string) bool {
+	// Strip any leading "a/" or "b/" defensively.
+	p = strings.TrimPrefix(p, "a/")
+	p = strings.TrimPrefix(p, "b/")
+	base := filepath.Base(p)
+	switch base {
+	case "repro.py", "reproduce_issue.py", "patch.diff", "plan.md":
+		return true
+	}
+	if strings.HasPrefix(base, "repro_") && strings.HasSuffix(base, ".py") {
+		return true
+	}
+	if strings.HasPrefix(base, "test_") && strings.HasSuffix(base, ".py") {
+		return true
+	}
+	if strings.HasSuffix(base, "_test.py") {
+		return true
+	}
+	if strings.Contains(p, "/tests/") || strings.Contains(p, "/test/") {
+		return true
+	}
+	// Workspace-root scratch (not under repo/): treat as sandbox.
+	if !strings.HasPrefix(p, "repo/") {
+		return true
+	}
+	return false
+}
+
+func ternStr(cond bool, a, b string) string {
+	if cond {
+		return a
+	}
+	return b
 }
 
 func maxInt(a, b int) int {

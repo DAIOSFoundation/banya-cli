@@ -452,20 +452,27 @@ func runHeadless(cmd *cobra.Command, _ []string) error {
 	// modes walk away with zero points even when the critic could
 	// rescue a wrong patch. Send a single "commit now" continuation
 	// turn with a tighter budget so the agent can lock in ANY patch.
-	if !wbLayout.Active() && !noPatchNudge && !nudgedThisRun && exitCode != 3 && !patchExists() {
+	// v18 — Diff Linter: also re-fire when patch.diff exists but only
+	// touches reproducer/test/workspace files (the matplotlib v16 sample 1
+	// terminal-attractor pattern: "found right file, never edited it,
+	// committed only repro.py").
+	reproducerOnlyAtTopNudge := patchHasOnlySandboxFiles(patchPath)
+	if !wbLayout.Active() && !noPatchNudge && !nudgedThisRun && exitCode != 3 && (!patchExists() || reproducerOnlyAtTopNudge) {
 		nudgedThisRun = true
 		issueSymbols := extractIssueSymbols(promptText)
 		fileHint := extractMostReadSourceFile(workDir)
 		emitMeta(out, map[string]any{
-			"phase":         "nudge",
-			"prev_exit":     exitReason,
-			"issue_symbols": issueSymbols,
-			"file_hint":     fileHint,
-			"session_id":    sessionID,
+			"phase":              "nudge",
+			"prev_exit":          exitReason,
+			"issue_symbols":      issueSymbols,
+			"file_hint":          fileHint,
+			"session_id":         sessionID,
+			"reason":             ternStr(reproducerOnlyAtTopNudge, "reproducer_only", "empty"),
+			"patch_only_sandbox": reproducerOnlyAtTopNudge,
 		})
 		_, exitReason, exitCode = runOneTurn(out, pc, protocol.ChatRequest{
 			SessionID:  sessionID, // continue the same conversation
-			Message:    buildNudgePromptWithSymbols(issueSymbols, fileHint),
+			Message:    buildNudgePromptWithSymbols(issueSymbols, fileHint, reproducerOnlyAtTopNudge),
 			WorkDir:    workDir,
 			PromptType: protocol.PromptType(promptTypeStr),
 		}, nudgeTimeout, idleAbort, thinkingAbort, autoApprove)
@@ -1294,7 +1301,7 @@ func extractIssueSymbols(prompt string) []string {
 }
 
 func buildNudgePrompt() string {
-	return buildNudgePromptWithSymbols(nil, "")
+	return buildNudgePromptWithSymbols(nil, "", false)
 }
 
 // buildNudgePromptWithSymbols renders the commit-now nudge with an
@@ -1302,7 +1309,13 @@ func buildNudgePrompt() string {
 // AND an optional file-hint (the most-frequently-read source file in
 // the trajectory so far). When both are present, the agent has nearly
 // zero ambiguity about WHERE to apply the fix.
-func buildNudgePromptWithSymbols(symbols []string, fileHint string) string {
+//
+// `reproducerOnly` (v18) — true when patch.diff exists but only adds
+// repro.py / test files / workspace scratch (the v16 matplotlib + django
+// terminal-attractor pattern). Switches the lead diagnosis from "patch is
+// empty" to "patch only adds reproducer/tests" and tightens guidance to
+// stop the agent from re-committing the same useless artefact.
+func buildNudgePromptWithSymbols(symbols []string, fileHint string, reproducerOnly bool) string {
 	symbolHint := ""
 	if len(symbols) > 0 {
 		quoted := make([]string, len(symbols))
@@ -1317,6 +1330,42 @@ func buildNudgePromptWithSymbols(symbols []string, fileHint string) string {
 	if fileHint != "" {
 		symbolHint += "Most-read file so far: `" + fileHint + "` — that is almost certainly your patch target.\n"
 	}
+
+	if reproducerOnly {
+		// v18 — Diff Linter path. The agent already has *a* patch.diff,
+		// but it only modifies reproducer / test / workspace files. The
+		// hidden test grader will apply this patch and find ZERO source
+		// changes → automatic 0. Tell the agent exactly that.
+		return "STOP. Your `patch.diff` exists but only modifies reproducer / test / workspace " +
+			"scratch files (e.g., `repro.py`, `reproduce_issue.py`, `test_*.py`). It does NOT touch " +
+			"any real source file under `repo/`. The hidden-test grader applies this patch and finds " +
+			"zero source changes → automatic 0.\n" +
+			symbolHint +
+			"\n" +
+			"You may have read the right file already. Reading is not enough — you must EDIT it.\n" +
+			"\n" +
+			"You already have enough signal. Do NOT call ast_search, read_file, glob_search, or " +
+			"ripgrep_search again in this turn. Do NOT re-create or re-run the reproducer — the " +
+			"reproducer is already in `patch.diff` and that's the problem.\n\n" +
+			"Now, in this order:\n" +
+			"1. Pick the symbol *explicitly named in the issue text* (function, class, method, " +
+			"attribute). Do NOT pick a different symbol you happen to know about in this repo.\n" +
+			"2. Call **update_file** (SEARCH/REPLACE) or **replace_lines** (line-number replacement, " +
+			"better for constants/settings files) on the source file containing that symbol with your " +
+			"best-guess minimal fix. This step is mandatory — skipping it leaves you with the same " +
+			"reproducer-only patch you have now.\n" +
+			"3. Regenerate patch.diff (only AFTER step 2):\n" +
+			"   cd repo && git add -A && git diff --cached > ../patch.diff && git restore --staged .\n" +
+			"4. Verify the new patch.diff modifies a file under `repo/` (not just `repro.py`):\n" +
+			"   grep '^diff --git' patch.diff\n" +
+			"   You should see a line referencing your source file under `repo/...`. If you only see " +
+			"`repro.py`, you skipped step 2 — go back and call update_file/replace_lines.\n" +
+			"\n" +
+			"An imperfect source patch will be reviewed by the critic and you will get a second " +
+			"chance to refine it. A reproducer-only patch is rejected and locks in score=0. Commit a " +
+			"real source edit now."
+	}
+
 	return "STOP. Your previous turn finished without producing patch.diff (or with patch.diff EMPTY — " +
 		"0 bytes) — that is an automatic 0.\n" +
 		symbolHint +
@@ -1516,9 +1565,16 @@ func classifyStage(toolName, path, command string, sawFix bool) planStage {
 // `fileHint` is the most-frequently-read source file in the agent's
 // trajectory so far — empty string when extraction yielded nothing,
 // in which case we fall back to symbol-only guidance.
-func buildCommitForcePrompt(symbols []string, fileHint string) string {
+func buildCommitForcePrompt(symbols []string, fileHint string, reproducerOnly bool) string {
 	var b strings.Builder
-	b.WriteString("LAST CHANCE — no patch.diff yet (or it's 0 bytes). The conversation has gathered enough context; this turn is for committing the fix, not for further exploration.\n\n")
+	if reproducerOnly {
+		b.WriteString("LAST CHANCE — your `patch.diff` only modifies reproducer / test / workspace " +
+			"files. It does NOT touch any real source file under `repo/`. The hidden grader will reject " +
+			"this and you'll score 0. This turn is for committing a real source edit, not for further " +
+			"exploration or for re-running the reproducer.\n\n")
+	} else {
+		b.WriteString("LAST CHANCE — no patch.diff yet (or it's 0 bytes). The conversation has gathered enough context; this turn is for committing the fix, not for further exploration.\n\n")
+	}
 
 	if len(symbols) > 0 {
 		quoted := make([]string, len(symbols))
