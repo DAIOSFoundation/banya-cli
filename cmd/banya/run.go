@@ -473,7 +473,7 @@ func runHeadless(cmd *cobra.Command, _ []string) error {
 	if !wbLayout.Active() && !noPatchNudge && !nudgedThisRun && exitCode != 3 && (!patchExists() || reproducerOnlyAtTopNudge) {
 		nudgedThisRun = true
 		issueSymbols := extractIssueSymbols(promptText)
-		fileHint := extractMostReadSourceFile(workDir)
+		fileHint := extractMostReadSourceFileValidated(workDir, issueSymbols)
 		emitMeta(out, map[string]any{
 			"phase":              "nudge",
 			"prev_exit":          exitReason,
@@ -1459,7 +1459,35 @@ func buildNudgePromptWithSymbols(symbols []string, fileHint string, reproducerOn
 // almost certainly the right one.
 //
 // Returns "" when the trajectory has no read_file actions yet.
+//
+// Wraps extractMostReadSourceFileValidated with no symbol cross-check,
+// preserved for non-SWE callers that don't have issueSymbols.
 func extractMostReadSourceFile(workDir string) string {
+	return extractMostReadSourceFileValidated(workDir, nil)
+}
+
+// extractMostReadSourceFileValidated is v18.2's anti-amplifier version
+// of fileHint extraction. When issueSymbols is non-empty, the returned
+// path is validated to actually contain at least one of those symbols
+// (cheap grep). This prevents the v18 flask-4045 failure mode where
+// the model's misdirected exploration (reading json/tag.py 3+ times
+// despite the issue being about Blueprint validation) crystallised
+// into a commit-force prompt that hardcoded the wrong file.
+//
+// Behaviour matrix:
+//
+//	issueSymbols == nil/empty       → return most-read (legacy behaviour)
+//	issueSymbols set, validated hit → return validated most-read file
+//	issueSymbols set, no hit at all → return "" (signals "no usable hint")
+//
+// The empty-string fallback is the key correctness move: when the
+// fileHint cannot be validated, the caller (commit-force / nudge)
+// falls back to "edit a file containing one of these symbols" guidance
+// without hardcoding a wrong file. v10 astropy success path is
+// preserved (separable.py contains _cstack — validation passes).
+// v18 flask failure path is severed (json/tag.py does not contain
+// Blueprint — validation fails, hint suppressed).
+func extractMostReadSourceFileValidated(workDir string, issueSymbols []string) string {
 	trajPath := filepath.Join(workDir, ".agent", "trajectory.jsonl")
 	f, err := os.Open(trajPath)
 	if err != nil {
@@ -1491,7 +1519,6 @@ func extractMostReadSourceFile(workDir string) string {
 		if path == "" || !strings.HasPrefix(path, "repo/") {
 			continue
 		}
-		// Skip test files — the bug is in the source, not the test.
 		if strings.Contains(path, "/tests/") || strings.Contains(path, "/test/") {
 			continue
 		}
@@ -1504,15 +1531,73 @@ func extractMostReadSourceFile(workDir string) string {
 	if len(counts) == 0 {
 		return ""
 	}
-	var best string
-	bestN := 0
+
+	// Sort candidates by count desc, path asc (for determinism).
+	type cand struct {
+		path string
+		n    int
+	}
+	cands := make([]cand, 0, len(counts))
 	for p, n := range counts {
-		if n > bestN || (n == bestN && p < best) {
-			bestN = n
-			best = p
+		cands = append(cands, cand{p, n})
+	}
+	sort.Slice(cands, func(i, j int) bool {
+		if cands[i].n != cands[j].n {
+			return cands[i].n > cands[j].n
+		}
+		return cands[i].path < cands[j].path
+	})
+
+	// No symbol filter → legacy behaviour: return the top-1.
+	if len(issueSymbols) == 0 {
+		return cands[0].path
+	}
+
+	// v18.2 — validate top candidates against issueSymbols. We check up
+	// to top-5 to allow some slack for the model's distraction; if none
+	// of the top-5 most-read files contain any issue symbol, the hint
+	// would be misleading and we suppress it.
+	maxCheck := 5
+	if len(cands) < maxCheck {
+		maxCheck = len(cands)
+	}
+	for i := 0; i < maxCheck; i++ {
+		absPath := cands[i].path
+		if !filepath.IsAbs(absPath) {
+			absPath = filepath.Join(workDir, absPath)
+		}
+		if fileContainsAnySymbol(absPath, issueSymbols) {
+			return cands[i].path
 		}
 	}
-	return best
+	// No top-N read file contains an issue symbol — suppress the hint.
+	return ""
+}
+
+// fileContainsAnySymbol returns true when `path` is readable and
+// contains at least one of the symbols as a substring. Cheap byte
+// match — does not need to be a full word boundary check; false
+// positives (substring match in comments / docstrings) are tolerable
+// because the worst case degrades to legacy fileHint behaviour.
+//
+// Returns false on read errors (unreadable / very large files >2MB)
+// to keep the validator from blocking on edge cases.
+func fileContainsAnySymbol(path string, symbols []string) bool {
+	st, err := os.Stat(path)
+	if err != nil || st.Size() > 2*1024*1024 {
+		return false
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return false
+	}
+	body := string(data)
+	for _, s := range symbols {
+		if s != "" && strings.Contains(body, s) {
+			return true
+		}
+	}
+	return false
 }
 
 // classifyStage maps a single tool invocation to one of the seven

@@ -171,41 +171,96 @@ func runBoN(
 	}
 
 	for i := 0; i < n; i++ {
-		// A. Reset workspace.
-		resetSWEWorkspace(workDir, out)
+		// v18.2 — wrap the per-sample body so we can:
+		//   (a) emit `swe_bo_n_sample_done` even on panic (defer/recover),
+		//       so the parent's BO@N harness always sees a sample's outcome
+		//   (b) capture multi-phase trajectory snapshots into bo<i>.jsonl
+		//       since banya-core overwrites trajectory.jsonl between turns
+		// v18 evidence (matplotlib + flask): sample-0 done events were
+		// missing entirely — silent crashes that confused post-hoc analysis.
+		// The defer guarantees the meta event surfaces even on panic.
+		c := func(i int) bonCandidate {
+			c := bonCandidate{Index: i}
+			doneEmitted := false
+			emitDone := func(extra map[string]any) {
+				if doneEmitted {
+					return
+				}
+				doneEmitted = true
+				payload := map[string]any{
+					"phase":          "swe_bo_n_sample_done",
+					"index":          i,
+					"has_patch":      c.HasPatch,
+					"patch_hash":     c.PatchHash,
+					"nudge_fired":    c.NudgeFired,
+					"commit_forced":  c.CommitForced,
+					"critic_ran":     c.CriticRan,
+					"critic_ok":      c.CriticOK,
+					"critic_revised": c.CriticRevised,
+					"pytest_ran":     c.PytestRan,
+					"pytest_pass":    c.PytestPass,
+					"pytest_revised": c.PytestRevised,
+					"score":          c.Score,
+					"session_id":     sessionID,
+				}
+				for k, v := range extra {
+					payload[k] = v
+				}
+				emitMeta(out, payload)
+			}
+			defer func() {
+				if r := recover(); r != nil {
+					emitMeta(out, map[string]any{
+						"phase":      "swe_bo_n_sample_panic",
+						"index":      i,
+						"panic":      fmt.Sprintf("%v", r),
+						"session_id": sessionID,
+					})
+					emitDone(map[string]any{"panic_recovered": true})
+				} else if !doneEmitted {
+					// Body exited cleanly without explicitly emitting done
+					// (e.g., the existing tail at end-of-iteration emits it).
+					// Belt-and-suspenders: emit if not yet emitted. The
+					// existing emit at line ~395 will set doneEmitted=true.
+				}
+			}()
 
-		// Temperature spread for diversity.
-		temp := tempMin
-		if n > 1 {
-			temp = tempMin + (tempMax-tempMin)*float64(i)/float64(n-1)
-		}
-		_ = os.Setenv("BANYA_SWE_BO_TEMPERATURE", fmt.Sprintf("%.3f", temp))
-		topP := 0.9 + 0.05*float64(i)/float64(maxInt(1, n-1))
-		_ = os.Setenv("BANYA_SWE_BO_TOP_P", fmt.Sprintf("%.3f", topP))
+			// A. Reset workspace.
+			resetSWEWorkspace(workDir, out)
 
-		emitMeta(out, map[string]any{
-			"phase":       "swe_bo_n_sample_start",
-			"index":       i,
-			"temperature": temp,
-			"top_p":       topP,
-			"session_id":  sessionID,
-		})
+			// Temperature spread for diversity.
+			temp := tempMin
+			if n > 1 {
+				temp = tempMin + (tempMax-tempMin)*float64(i)/float64(n-1)
+			}
+			c.Temperature = temp
+			_ = os.Setenv("BANYA_SWE_BO_TEMPERATURE", fmt.Sprintf("%.3f", temp))
+			topP := 0.9 + 0.05*float64(i)/float64(maxInt(1, n-1))
+			_ = os.Setenv("BANYA_SWE_BO_TOP_P", fmt.Sprintf("%.3f", topP))
 
-		c := bonCandidate{Index: i, Temperature: temp}
+			emitMeta(out, map[string]any{
+				"phase":       "swe_bo_n_sample_start",
+				"index":       i,
+				"temperature": temp,
+				"top_p":       topP,
+				"session_id":  sessionID,
+			})
 
-		// B. Agent run.
-		samplePromptType := promptTypeStr
-		_, exitReason, exitCode := runOneTurn(out, pc, protocol.ChatRequest{
-			SessionID:  fmt.Sprintf("%s-bo%d", sessionID, i),
-			Message:    promptText,
-			WorkDir:    workDir,
-			PromptType: protocol.PromptType(samplePromptType),
-		}, effectiveTimeout, idleAbort, thinkingAbort, autoApprove)
-		refreshPatchDiff(workDir, out)
-		c.Notes = fmt.Sprintf("agent_exit=%s", exitReason)
-		if exitCode != 0 {
-			c.Notes += " (sample non-zero exit)"
-		}
+			// B. Agent run.
+			samplePromptType := promptTypeStr
+			_, exitReason, exitCode := runOneTurn(out, pc, protocol.ChatRequest{
+				SessionID:  fmt.Sprintf("%s-bo%d", sessionID, i),
+				Message:    promptText,
+				WorkDir:    workDir,
+				PromptType: protocol.PromptType(samplePromptType),
+			}, effectiveTimeout, idleAbort, thinkingAbort, autoApprove)
+			refreshPatchDiff(workDir, out)
+			// v18.2 — capture main-agent trajectory before nudge clobbers it.
+			_ = appendTrajectoryPhase(workDir, i, "main_agent")
+			c.Notes = fmt.Sprintf("agent_exit=%s", exitReason)
+			if exitCode != 0 {
+				c.Notes += " (sample non-zero exit)"
+			}
 
 		// C. Nudge if no patch.diff (banya feature).
 		//
@@ -219,7 +274,7 @@ func runBoN(
 		// into both nudge and commit-force prompts (v11). Empty
 		// string when the agent did no read_file calls; both prompts
 		// fall back to symbol-only guidance in that case.
-		fileHint := extractMostReadSourceFile(workDir)
+		fileHint := extractMostReadSourceFileValidated(workDir, issueSymbols)
 
 		// v18 — Diff Linter: also re-fire nudge when the patch exists
 		// but only touches reproducer/test/workspace files (the
@@ -274,7 +329,7 @@ func runBoN(
 			}
 			// Re-extract fileHint — the nudge phase may have added
 			// fresh reads that change the most-read target.
-			fileHint = extractMostReadSourceFile(workDir)
+			fileHint = extractMostReadSourceFileValidated(workDir, issueSymbols)
 			emitMeta(out, map[string]any{
 				"phase":              "swe_bo_n_commit_force",
 				"index":              i,
@@ -315,6 +370,7 @@ func runBoN(
 						PromptType: protocol.PromptType(samplePromptType),
 					}, effectiveTimeout, idleAbort, thinkingAbort, autoApprove)
 					refreshPatchDiff(workDir, out)
+					_ = appendTrajectoryPhase(workDir, i, "critic_revise")
 					c.CriticRevised = true
 					if patchExistsAt(patchPath) {
 						data2, _ := os.ReadFile(patchPath)
@@ -348,6 +404,7 @@ func runBoN(
 						PromptType: protocol.PromptType(samplePromptType),
 					}, effectiveTimeout, idleAbort, thinkingAbort, autoApprove)
 					refreshPatchDiff(workDir, out)
+					_ = appendTrajectoryPhase(workDir, i, "pytest_revise")
 					c.PytestRevised = true
 					if patchExistsAt(patchPath) {
 						p2Ctx, p2Cancel := context.WithTimeout(ctx, time.Duration(pytestTimeoutS)*time.Second)
@@ -376,45 +433,35 @@ func runBoN(
 			}
 		}
 
-		emitMeta(out, map[string]any{
-			"phase":          "swe_bo_n_sample_done",
-			"index":          i,
-			"has_patch":      c.HasPatch,
-			"patch_hash":     c.PatchHash,
-			"nudge_fired":    c.NudgeFired,
-			"commit_forced":  c.CommitForced,
-			"critic_ran":     c.CriticRan,
-			"critic_ok":      c.CriticOK,
-			"critic_revised": c.CriticRevised,
-			"pytest_ran":     c.PytestRan,
-			"pytest_pass":    c.PytestPass,
-			"pytest_revised": c.PytestRevised,
-			"score":          c.Score,
-			"session_id":     sessionID,
-		})
-		candidates = append(candidates, c)
+			// v18.2 — capture FINAL phase trajectory snapshot (covers
+			// critic-revise / pytest-revise turns appended to trajectory.jsonl).
+			_ = appendTrajectoryPhase(workDir, i, "final")
 
-		// Trajectory backup. The next sample's banya-core invocation
-		// truncates `.agent/trajectory.jsonl` (observed empirically in v6:
-		// sample 0 had ~41 tool calls but its trajectory was wiped when
-		// sample 1 started). When BANYA_SWE_BO_KEEP_LOSERS=1 is set, copy
-		// the full trajectory to `trajectory.bo<i>.jsonl` so the SIBDD
-		// exporter can materialise per-sample preference data.
-		if os.Getenv("BANYA_SWE_BO_KEEP_LOSERS") == "1" {
-			src := filepath.Join(workDir, ".agent", "trajectory.jsonl")
-			dst := filepath.Join(workDir, ".agent", fmt.Sprintf("trajectory.bo%d.jsonl", i))
-			if err := copyFileForBackup(src, dst); err == nil {
-				emitMeta(out, map[string]any{
-					"phase":      "swe_bo_n_trajectory_backup",
-					"index":      i,
-					"path":       dst,
-					"session_id": sessionID,
-				})
+			emitDone(nil)
+
+			// Trajectory backup. v18.2 changed semantics: the per-phase
+			// `appendTrajectoryPhase` calls already accumulated into
+			// `trajectory.bo<i>.jsonl` over the lifetime of this sample,
+			// so we DON'T overwrite it here (which would drop the multi-
+			// phase forensic log). Just emit the marker that backup exists.
+			if os.Getenv("BANYA_SWE_BO_KEEP_LOSERS") == "1" {
+				dst := filepath.Join(workDir, ".agent", fmt.Sprintf("trajectory.bo%d.jsonl", i))
+				if _, err := os.Stat(dst); err == nil {
+					emitMeta(out, map[string]any{
+						"phase":      "swe_bo_n_trajectory_backup",
+						"index":      i,
+						"path":       dst,
+						"session_id": sessionID,
+						"mode":       "phase_appended",
+					})
+				}
 			}
-		}
 
-		_ = os.Unsetenv("BANYA_SWE_BO_TEMPERATURE")
-		_ = os.Unsetenv("BANYA_SWE_BO_TOP_P")
+			_ = os.Unsetenv("BANYA_SWE_BO_TEMPERATURE")
+			_ = os.Unsetenv("BANYA_SWE_BO_TOP_P")
+			return c
+		}(i)
+		candidates = append(candidates, c)
 	}
 
 	// Pick winner.
@@ -863,4 +910,68 @@ func copyFileForBackup(src, dst string) error {
 		return err
 	}
 	return out.Sync()
+}
+
+// appendFileForBackup is the v18.2 multi-phase forensics helper. Reads
+// `src` and APPENDS to `dst` (creating it if missing). Used to capture
+// trajectory.jsonl at each phase transition (main agent → nudge →
+// commit-force → critic → pytest), since banya-core overwrites
+// trajectory.jsonl between turns and a single end-of-iteration copy
+// only captures the final phase. Best-effort: missing src silently
+// tolerated.
+//
+// Why phase-by-phase append matters: v18 flask-4045 evidence showed
+// trajectory.bo1.jsonl had only 2 actions (the commit-force turn), so
+// we couldn't see what the main agent did during exploration. With
+// per-phase append, each phase's events are concatenated into the
+// per-sample backup before the next phase clobbers trajectory.jsonl.
+func appendFileForBackup(src, dst string) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	out, err := os.OpenFile(dst, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	if err != nil {
+		return err
+	}
+	defer out.Close()
+	if _, err := io.Copy(out, in); err != nil {
+		return err
+	}
+	return out.Sync()
+}
+
+// appendTrajectoryPhase emits a phase-boundary marker into the per-
+// sample trajectory backup, then appends the current trajectory.jsonl
+// contents. Designed to be called immediately after each BO@N phase
+// (main agent / nudge / commit-force / critic-revise / pytest-revise).
+//
+// Marker format (a single JSON line, parsed downstream by SIBDD):
+//
+//	{"kind":"meta","phase":"swe_bo_phase_boundary","sample":<i>,"phase_name":"<name>","ts_ms":<unix_ms>}
+//
+// Returns nil on success or when src is missing (this is normal —
+// nudge phase didn't fire, etc.); other errors are returned.
+func appendTrajectoryPhase(workDir string, sampleIdx int, phaseName string) error {
+	src := filepath.Join(workDir, ".agent", "trajectory.jsonl")
+	if _, err := os.Stat(src); err != nil {
+		return nil // nothing to append yet; phase didn't fire
+	}
+	dst := filepath.Join(workDir, ".agent", fmt.Sprintf("trajectory.bo%d.jsonl", sampleIdx))
+	// Write phase boundary marker first.
+	marker := fmt.Sprintf(
+		`{"kind":"meta","phase":"swe_bo_phase_boundary","sample":%d,"phase_name":%q,"ts_ms":%d}`+"\n",
+		sampleIdx, phaseName, time.Now().UnixMilli(),
+	)
+	mf, err := os.OpenFile(dst, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	if err != nil {
+		return err
+	}
+	if _, err := mf.WriteString(marker); err != nil {
+		mf.Close()
+		return err
+	}
+	mf.Close()
+	return appendFileForBackup(src, dst)
 }
