@@ -121,6 +121,14 @@ func readBoChildMeta(path string) (boChildMeta, error) {
 // of them, and returns the same (winner, candidates) shape as the
 // sequential runBoN's tail.
 //
+// `promptText` is the user-message body the parent received via stdin
+// from banya-eval. The orchestrator forwards this to each child's
+// stdin so child banya-cli's resolvePrompt() returns the correct task
+// description. Without forwarding, child stdin is /dev/null, prompt is
+// empty, extractIssueSymbols returns nil, nudge fileHint is "", and
+// the agent has no idea what to do (observed empirically as
+// idle_abort / thinking_abort / write_tool_deadline in v18.3 smoke).
+//
 // Caller (in runBoN) is expected to handle the dispatch:
 //
 //	if os.Getenv("BANYA_SWE_BO_PARALLEL") == "1" && os.Getenv("BANYA_SWE_BO_CHILD_INDEX") == "" {
@@ -131,6 +139,7 @@ func runBoNViaChildren(
 	out *bufio.Writer,
 	sessionID string,
 	workDir, patchPath string,
+	promptText string,
 	n int,
 	tempMin, tempMax float64,
 	perChildTimeout time.Duration,
@@ -240,6 +249,14 @@ func runBoNViaChildren(
 			cmd := exec.CommandContext(cctx, executable, argsWithWS...)
 			cmd.Stdout = logF
 			cmd.Stderr = errF
+			// CRITICAL — forward parent's prompt to child via stdin.
+			// banya-eval passes the SWE-bench task description on stdin
+			// to the parent banya-cli. Without this Stdin assignment,
+			// the child gets /dev/null, resolvePrompt returns "", and
+			// the agent runs without any task context. This was the
+			// root cause of v18.3 smoke's 4/4 FAIL (issue_symbols:null,
+			// file_hint:"" in every nudge event).
+			cmd.Stdin = strings.NewReader(promptText)
 			// Per-child env: clear PARALLEL flag so child doesn't try to
 			// spawn grandchildren; set CHILD_INDEX so child knows to write
 			// bo_meta.json at exit; set per-sample temperature/top_p.

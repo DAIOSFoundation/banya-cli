@@ -158,6 +158,7 @@ func runBoN(
 		return runBoNViaChildren(
 			ctx, out, sessionID,
 			workDir, patchPath,
+			promptText,
 			n, tempMin, tempMax,
 			perChildCap,
 			keepLosers,
