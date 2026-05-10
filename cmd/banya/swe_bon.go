@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -127,15 +128,35 @@ func runBoN(
 	// reuses the same list, since the issue is the same across samples.
 	issueSymbols := extractIssueSymbols(promptText)
 
+	// Parallel-mode detection (Parallel B v1 — see docs/PARALLEL_B_DESIGN.md).
+	// Opt-in via BANYA_SWE_BO_PARALLEL=1. v1 currently emits a meta event
+	// indicating parallel mode is requested but not yet supported in this
+	// build, then falls back to sequential. v2 will add either:
+	//   (a) per-session event demultiplexing in ProcessClient + goroutines, or
+	//   (b) child banya-cli process spawning (process-isolated samples)
+	// Both options preserve the "no interference with existing CLI" rule
+	// because the default (env var unset) is byte-identical to current code.
+	parallelEnabled := os.Getenv("BANYA_SWE_BO_PARALLEL") == "1"
+	if parallelEnabled && n > 1 {
+		emitMeta(out, map[string]any{
+			"phase":   "swe_bo_n_parallel_unsupported",
+			"version": "v1",
+			"reason":  "ProcessClient event channel is shared across sessions; goroutine concurrency would scramble events. Falling back to sequential.",
+			"plan":    "v2 = child-process isolation OR per-session event demux (see docs/PARALLEL_B_DESIGN.md §11-12)",
+		})
+		// Fall through — sequential code path below runs unchanged.
+	}
+
 	emitMeta(out, map[string]any{
-		"phase":               "swe_bo_n_start",
-		"n":                   n,
-		"temp_min":            tempMin,
-		"temp_max":            tempMax,
-		"revise_per_phase":    revisePerPhase,
+		"phase":                "swe_bo_n_start",
+		"n":                    n,
+		"temp_min":             tempMin,
+		"temp_max":             tempMax,
+		"revise_per_phase":     revisePerPhase,
 		"per_sample_timeout_s": int(effectiveTimeout.Seconds()),
-		"issue_symbols":       issueSymbols,
-		"session_id":          sessionID,
+		"issue_symbols":        issueSymbols,
+		"session_id":           sessionID,
+		"parallel_requested":   parallelEnabled,
 	})
 
 	candidates = make([]bonCandidate, 0, n)
@@ -645,6 +666,96 @@ func ternStr(cond bool, a, b string) string {
 		return a
 	}
 	return b
+}
+
+// setupSampleWorktree creates an isolated git worktree for a BO@N sample
+// under <workDir>/.bo/<idx>/repo, with its own branch banya-bo-<idx>
+// pointing at HEAD. Returns the sample workspace dir (<workDir>/.bo/<idx>)
+// or an error if setup failed. Caller is responsible for `teardownSampleWorktree`.
+//
+// Parallel B v1: this helper is wired and tested but not yet called by
+// runBoN (see swe_bon.go's parallel-mode dispatch). The worktree mechanism
+// is the foundation for v2's true sample-level parallelism.
+//
+// Why git worktree (vs cp -r): shared object DB → ~5-10× less disk + ~30×
+// faster setup than a recursive copy. Per-sample branch lets each sample
+// produce an independent `git diff > patch.diff` without ref collisions.
+func setupSampleWorktree(workDir string, idx int) (string, error) {
+	canonicalRepo := filepath.Join(workDir, "repo")
+	if _, err := os.Stat(filepath.Join(canonicalRepo, ".git")); err != nil {
+		return "", fmt.Errorf("canonical repo missing .git: %w", err)
+	}
+	sampleDir := filepath.Join(workDir, ".bo", strconv.Itoa(idx))
+	sampleRepo := filepath.Join(sampleDir, "repo")
+	if err := os.MkdirAll(sampleDir, 0o755); err != nil {
+		return "", fmt.Errorf("mkdir sample dir: %w", err)
+	}
+	// Best-effort: remove any prior worktree at this path (from a crashed
+	// previous run). `git worktree remove` is idempotent enough for our use.
+	branch := fmt.Sprintf("banya-bo-%d", idx)
+	_ = exec.Command("git", "worktree", "remove", "--force", sampleRepo).Run()
+	_ = exec.Command("git", "branch", "-D", branch).Run()
+	if err := os.RemoveAll(sampleRepo); err != nil {
+		return "", fmt.Errorf("remove stale sample repo: %w", err)
+	}
+	cmd := exec.Command("git", "worktree", "add", "-B", branch, sampleRepo, "HEAD")
+	cmd.Dir = canonicalRepo
+	if out2, err := cmd.CombinedOutput(); err != nil {
+		return "", fmt.Errorf("worktree add: %w (output: %s)", err, strings.TrimSpace(string(out2)))
+	}
+	return sampleDir, nil
+}
+
+// teardownSampleWorktree cleanly removes the worktree + branch + sample dir
+// created by setupSampleWorktree. Best-effort: failures are logged via
+// emitMeta but never abort the BO@N flow.
+func teardownSampleWorktree(workDir string, idx int, out *bufio.Writer) {
+	sampleRepo := filepath.Join(workDir, ".bo", strconv.Itoa(idx), "repo")
+	branch := fmt.Sprintf("banya-bo-%d", idx)
+	canonicalRepo := filepath.Join(workDir, "repo")
+
+	// Remove worktree (must run from inside canonicalRepo, not sampleRepo,
+	// to avoid "cannot remove the current worktree" error).
+	rm := exec.Command("git", "worktree", "remove", "--force", sampleRepo)
+	rm.Dir = canonicalRepo
+	if out2, err := rm.CombinedOutput(); err != nil {
+		emitMeta(out, map[string]any{
+			"phase":  "swe_bo_n_worktree_teardown_warning",
+			"index":  idx,
+			"error":  err.Error(),
+			"output": strings.TrimSpace(string(out2)),
+		})
+	}
+	// Delete the branch.
+	branchRm := exec.Command("git", "branch", "-D", branch)
+	branchRm.Dir = canonicalRepo
+	_ = branchRm.Run()
+	// Best-effort RemoveAll for the sample dir (worktree remove may leave
+	// auxiliary files like patch.diff or .agent/ that we created).
+	_ = os.RemoveAll(filepath.Join(workDir, ".bo", strconv.Itoa(idx)))
+}
+
+// cleanupOrphanWorktrees scans <workDir>/.bo/* and tears down any leftover
+// worktrees from a prior crashed run. Idempotent. Called at the start of
+// runBoN to ensure a clean slate.
+//
+// Parallel B v1: wired but only invoked in parallel mode. Sequential mode
+// is unaffected — no .bo/ dir is created in sequential.
+func cleanupOrphanWorktrees(workDir string, out *bufio.Writer) {
+	boRoot := filepath.Join(workDir, ".bo")
+	entries, err := os.ReadDir(boRoot)
+	if err != nil {
+		return // No .bo/ dir → nothing to clean.
+	}
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		if idx, err := strconv.Atoi(e.Name()); err == nil {
+			teardownSampleWorktree(workDir, idx, out)
+		}
+	}
+	_ = os.Remove(boRoot)
 }
 
 func maxInt(a, b int) int {
