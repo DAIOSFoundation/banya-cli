@@ -3,6 +3,8 @@ package main
 import (
 	"bufio"
 	"context"
+	"crypto/sha1"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -456,6 +458,17 @@ func runHeadless(cmd *cobra.Command, _ []string) error {
 	// touches reproducer/test/workspace files (the matplotlib v16 sample 1
 	// terminal-attractor pattern: "found right file, never edited it,
 	// committed only repro.py").
+	// v2 Parallel B child-mode signal tracking. When BANYA_SWE_BO_CHILD_INDEX
+	// is set in env, this banya-cli is running as a BO@N child. We track
+	// the verifier signals across phases here and emit a bo_meta.json at
+	// exit so the parent process can read them and apply scoreBoNCandidate.
+	// Outside child mode these vars are dead — no behavior change.
+	childIndex, _ := strconv.Atoi(os.Getenv("BANYA_SWE_BO_CHILD_INDEX"))
+	isBoNChild := os.Getenv("BANYA_SWE_BO_CHILD_INDEX") != ""
+	var childCriticRan, childCriticOK, childCriticRevised bool
+	var childPytestRan, childPytestPass, childPytestRevised bool
+	childStartedAt := time.Now()
+
 	reproducerOnlyAtTopNudge := patchHasOnlySandboxFiles(patchPath)
 	if !wbLayout.Active() && !noPatchNudge && !nudgedThisRun && exitCode != 3 && (!patchExists() || reproducerOnlyAtTopNudge) {
 		nudgedThisRun = true
@@ -504,6 +517,10 @@ func runHeadless(cmd *cobra.Command, _ []string) error {
 				ctx, cancel := context.WithTimeout(cmd.Context(), 90*time.Second)
 				decision, cerr := reviewer.ReviewPatch(ctx, issueText, string(patchBytes), workDir)
 				cancel()
+				childCriticRan = true
+				if cerr == nil {
+					childCriticOK = decision.OK
+				}
 				if cerr != nil {
 					emitMeta(out, map[string]any{
 						"phase":      "critic_error",
@@ -541,6 +558,7 @@ func runHeadless(cmd *cobra.Command, _ []string) error {
 					PromptType: protocol.PromptType(promptTypeStr),
 				}, timeout, idleAbort, thinkingAbort, autoApprove)
 				refreshPatchDiff(workDir, out)
+				childCriticRevised = true
 				if exitCode != 0 || !patchExists() {
 					break
 				}
@@ -574,6 +592,8 @@ func runHeadless(cmd *cobra.Command, _ []string) error {
 			pCtx, pCancel := context.WithTimeout(cmd.Context(), time.Duration(swePytestTimeout)*time.Second)
 			pytestPassed, pytestFeedback := runProjectPytest(pCtx, workDir, pytestTestFiles, swePytestTimeout)
 			pCancel()
+			childPytestRan = true
+			childPytestPass = pytestPassed
 			emitMeta(out, map[string]any{
 				"phase":          "swe_pytest_gate",
 				"stage":          "post_critic",
@@ -592,10 +612,12 @@ func runHeadless(cmd *cobra.Command, _ []string) error {
 					PromptType: protocol.PromptType(promptTypeStr),
 				}, timeout, idleAbort, thinkingAbort, autoApprove)
 				refreshPatchDiff(workDir, out)
+				childPytestRevised = true
 				if exitCode == 0 && patchExists() {
 					pCtx2, pCancel2 := context.WithTimeout(cmd.Context(), time.Duration(swePytestTimeout)*time.Second)
 					pytestPassed2, _ := runProjectPytest(pCtx2, workDir, pytestTestFiles, swePytestTimeout)
 					pCancel2()
+					childPytestPass = pytestPassed2
 					emitMeta(out, map[string]any{
 						"phase":      "swe_pytest_gate",
 						"stage":      "post_revise",
@@ -612,6 +634,35 @@ func runHeadless(cmd *cobra.Command, _ []string) error {
 				"session_id":    sessionID,
 			})
 		}
+	}
+
+	// v2 Parallel B — child mode: emit bo_meta.json so the parent can
+	// reconstruct a bonCandidate and apply scoreBoNCandidate. We compute
+	// has_patch + patch_hash here from the canonical patchPath.
+	if isBoNChild {
+		hasPatch := patchExists()
+		var patchHash string
+		if hasPatch {
+			if data, err := os.ReadFile(patchPath); err == nil {
+				h := sha1.Sum(data)
+				patchHash = hex.EncodeToString(h[:])[:12]
+			}
+		}
+		_ = writeBoChildMeta(out, workDir, boChildMeta{
+			Index:         childIndex,
+			HasPatch:      hasPatch,
+			PatchHash:     patchHash,
+			PatchPath:     patchPath,
+			NudgeFired:    nudgedThisRun,
+			CommitForced:  false, // commit-force only exists in BO@N path; child runs regular flow
+			CriticRan:     childCriticRan,
+			CriticOK:      childCriticOK,
+			CriticRevised: childCriticRevised,
+			PytestRan:     childPytestRan,
+			PytestPass:    childPytestPass,
+			PytestRevised: childPytestRevised,
+			WallElapsedS:  int(time.Since(childStartedAt).Seconds()),
+		})
 	}
 
 	emitMeta(out, map[string]any{

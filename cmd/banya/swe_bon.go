@@ -128,23 +128,27 @@ func runBoN(
 	// reuses the same list, since the issue is the same across samples.
 	issueSymbols := extractIssueSymbols(promptText)
 
-	// Parallel-mode detection (Parallel B v1 — see docs/PARALLEL_B_DESIGN.md).
-	// Opt-in via BANYA_SWE_BO_PARALLEL=1. v1 currently emits a meta event
-	// indicating parallel mode is requested but not yet supported in this
-	// build, then falls back to sequential. v2 will add either:
-	//   (a) per-session event demultiplexing in ProcessClient + goroutines, or
-	//   (b) child banya-cli process spawning (process-isolated samples)
-	// Both options preserve the "no interference with existing CLI" rule
-	// because the default (env var unset) is byte-identical to current code.
+	// Parallel-mode dispatch (Parallel B v2 — C-process implementation).
+	// Opt-in via BANYA_SWE_BO_PARALLEL=1. The default (env var unset) is
+	// byte-identical to the sequential code path that follows.
+	//
+	// CHILD safeguard: a child banya-cli (spawned by the parent's
+	// runBoNViaChildren) has BANYA_SWE_BO_CHILD_INDEX set + we ALSO clear
+	// BANYA_SWE_BO_PARALLEL when spawning, so child should never enter
+	// this branch. Belt-and-suspenders: explicitly skip when CHILD_INDEX
+	// is set, in case env propagation gets weird.
 	parallelEnabled := os.Getenv("BANYA_SWE_BO_PARALLEL") == "1"
-	if parallelEnabled && n > 1 {
-		emitMeta(out, map[string]any{
-			"phase":   "swe_bo_n_parallel_unsupported",
-			"version": "v1",
-			"reason":  "ProcessClient event channel is shared across sessions; goroutine concurrency would scramble events. Falling back to sequential.",
-			"plan":    "v2 = child-process isolation OR per-session event demux (see docs/PARALLEL_B_DESIGN.md §11-12)",
-		})
-		// Fall through — sequential code path below runs unchanged.
+	isChild := os.Getenv("BANYA_SWE_BO_CHILD_INDEX") != ""
+	if parallelEnabled && !isChild && n > 1 {
+		// Honour BANYA_SWE_BO_KEEP_LOSERS the same way sequential does.
+		keepLosers := os.Getenv("BANYA_SWE_BO_KEEP_LOSERS") == "1"
+		return runBoNViaChildren(
+			ctx, out, sessionID,
+			workDir, patchPath,
+			n, tempMin, tempMax,
+			effectiveTimeout+nudgeTimeout, // generous per-child wallclock cap
+			keepLosers,
+		)
 	}
 
 	emitMeta(out, map[string]any{
