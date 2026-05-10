@@ -447,19 +447,48 @@ func runBoN(
 //
 //	pytest pass = +10  (strongest, mirrors hidden test suite)
 //	critic OK   = +5   (LLM judge agreement)
-//	patch       = +1   (vs no patch)
+//	patch       = +1   (vs no patch) — but ONLY if at least one verifier
+//	                   accepts (v18.1: closes the perverse-incentive loophole
+//	                   where a patch rejected by both verifiers still wins
+//	                   over no-patch via has_patch=1).
 //
-// pytest_ran && !pytest_pass scores 0 (neutral) — a sample that tried
-// shouldn't be ranked below one that didn't even reach pytest.
+// v18.1 changes (paper §9.8 evidence — Hallucination Conservation):
+//
+//   - **Verifier-rejected patches no longer beat no-patch.**
+//     v18 evidence (django + matplotlib): both samples produced patches
+//     where critic_ok=false AND pytest_pass=false (or pytest skipped),
+//     yet has_patch=1 made them winners. The model learned to submit
+//     "confident garbage" instead of failing honestly. Now: if both
+//     verifiers reject, has_patch contributes 0 — tying with no-patch
+//     so the tiebreaker prefers the cleaner no-patch sample (which can
+//     re-trigger nudge in a fresh turn).
+//   - **pytest_skipped is treated as not-passing (unchanged from before
+//     but explicitly documented).** The condition `c.PytestRan && c.PytestPass`
+//     already required pytest to actually run; skipped pytest still scores
+//     0. v18 matplotlib won via has_patch=1 because the model fabricated
+//     a NEW module that pytest couldn't find tests for → pytest_skipped
+//     → pytest_score=0 → has_patch=1 carried the win. The fix in (1)
+//     above closes this hole because critic_ok was also false.
+//
+// Behavioural matrix (post v18.1):
+//
+//	critic_ok  pytest_pass  has_patch  →  score
+//	  true       true         true     →  16   (both verifiers accept)
+//	  true       false/skip   true     →   6   (critic-only accept)
+//	  false      true         true     →  11   (pytest-only accept; rare)
+//	  false      false/skip   true     →   0   (rejected — was 1 pre-v18.1)
+//	  -          -            false    →   0
 func scoreBoNCandidate(c bonCandidate) int {
 	score := 0
-	if c.HasPatch {
+	pytestAccepted := c.PytestRan && c.PytestPass
+	criticAccepted := c.CriticRan && c.CriticOK
+	if c.HasPatch && (pytestAccepted || criticAccepted) {
 		score += 1
 	}
-	if c.PytestRan && c.PytestPass {
+	if pytestAccepted {
 		score += 10
 	}
-	if c.CriticRan && c.CriticOK {
+	if criticAccepted {
 		score += 5
 	}
 	return score
@@ -468,6 +497,22 @@ func scoreBoNCandidate(c bonCandidate) int {
 // resetSWEWorkspace returns the SWE-bench task workspace to a clean
 // pre-attempt state. Best-effort: missing repo/.git is silently
 // tolerated so a workspace that lost its git state doesn't abort BO@N.
+//
+// v18.1 — three changes addressing workspace leak found in matplotlib v18:
+//
+//  1. `git clean -fdx` (was `-fd`): also remove .gitignore'd files. Some
+//     repos (e.g., matplotlib) generate files like `_version.py` from
+//     setuptools_scm that are gitignored but still pollute later samples
+//     if left from a previous attempt.
+//
+//  2. Capture stderr from each git command and log it on non-zero exit.
+//     Previously errors were silently swallowed (`_ = cmd.Run()`), so a
+//     failed reset between samples was indistinguishable from a successful
+//     one. Sample 0/1 cross-contamination was undetectable.
+//
+//  3. Verify post-reset cleanliness with `git status --porcelain`. If
+//     untracked files remain after `clean -fdx`, log them as a warning so
+//     future debugging has a signal.
 func resetSWEWorkspace(workDir string, out *bufio.Writer) {
 	repoRoot := filepath.Join(workDir, "repo")
 
@@ -484,13 +529,36 @@ func resetSWEWorkspace(workDir string, out *bufio.Writer) {
 		})
 		return
 	}
+	resetIssues := []string{}
 	for _, args := range [][]string{
 		{"reset", "--hard", "HEAD"},
-		{"clean", "-fd"},
+		{"clean", "-fdx"},
 	} {
 		cmd := exec.Command("git", args...)
 		cmd.Dir = repoRoot
-		_ = cmd.Run()
+		out2, err := cmd.CombinedOutput()
+		if err != nil {
+			resetIssues = append(resetIssues,
+				fmt.Sprintf("git %s: %s (output: %s)",
+					strings.Join(args, " "), err.Error(), strings.TrimSpace(string(out2))))
+		}
+	}
+	// Verify cleanliness — if anything is still untracked/modified after
+	// the reset, the next sample will start in a polluted workspace.
+	statusCmd := exec.Command("git", "status", "--porcelain")
+	statusCmd.Dir = repoRoot
+	if statusOut, err := statusCmd.Output(); err == nil {
+		dirty := strings.TrimSpace(string(statusOut))
+		if dirty != "" {
+			resetIssues = append(resetIssues,
+				fmt.Sprintf("workspace still dirty after reset: %s", dirty))
+		}
+	}
+	if len(resetIssues) > 0 {
+		emitMeta(out, map[string]any{
+			"phase":  "swe_bo_n_reset_warning",
+			"issues": resetIssues,
+		})
 	}
 }
 
