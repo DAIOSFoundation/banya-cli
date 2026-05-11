@@ -210,7 +210,18 @@ func (r *Reviewer) ReviewPatch(ctx context.Context, issue, patch, repoRoot strin
 	}
 
 	threshold := thresholdFor(r.DomainTier)
-	prompt := buildReviewPrompt(issue, patch, fileContext, reproducerEvidence, staticEvidence, regressionEvidence, r.DomainTier, threshold)
+	// Paper §9.9 / Track B: v2 critic prompt with behavioural-equivalence
+	// framing + Alternative-Path Auditor. Opt-in via
+	// `BANYA_CRITIC_PROMPT_VERSION=v2`; default (legacy v1) is unchanged so
+	// existing benchmarks keep their published comparability. A/B
+	// validation on run-1 archived patches yielded F1 0.00 (v1) → 1.00
+	// (v2.1) — see scripts/critic_v2_ab.py and paper §9.9.
+	var prompt string
+	if os.Getenv("BANYA_CRITIC_PROMPT_VERSION") == "v2" {
+		prompt = buildReviewPromptV2(issue, patch, fileContext, reproducerEvidence, staticEvidence, regressionEvidence, r.DomainTier, threshold)
+	} else {
+		prompt = buildReviewPrompt(issue, patch, fileContext, reproducerEvidence, staticEvidence, regressionEvidence, r.DomainTier, threshold)
+	}
 
 	// Resolve the provider. Legacy callers that built &Reviewer{APIKey:...}
 	// still work — we construct a GeminiProvider on the fly.
@@ -383,6 +394,184 @@ Emit ONLY a JSON object matching this shape. No markdown fences, no commentary o
 - If ruff shows an error-level finding in modified files, ok MUST be false.
 - If the Edge-Case Hunter expert (see §6) flags any of the three probes as a likely miss, ok MUST be false.
 - issues array may be empty when ok=true; revise_directives may be empty when ok=true.
+`, issue, patch, fileContext, reproducerEvidence, staticEvidence, regressionEvidence,
+		threshold.Total, threshold.Correctness, threshold.Completeness, threshold.MaxSeverity,
+		func() string {
+			if domainTier == "" {
+				return "medium"
+			}
+			return domainTier
+		}())
+}
+
+// buildReviewPromptV2 — Track B (paper §9.9) redesigned critic prompt.
+//
+// Differences from v1 (the four §9.9 bias sources, each surgically fixed):
+//
+//   §1 Identity: removes "assume the patch is wrong" stance; replaces with
+//      "trace whether the patch's runtime behavior satisfies the outcome
+//      the issue describes — regardless of which file it touches".
+//   §3 Constraints: default stance flipped from REVISE → trace behavior.
+//      Reject only when a specific input falsifies the patched code path.
+//   §5 Rubric: 'correctness' → 'behavioral_correctness' — explicit name
+//      change so the scorer evaluates runtime outcome, not symbolic match.
+//   §6 Reasoning: ADDS a 5th expert, the Alternative-Path Auditor, with
+//      an import-isolation check (§6.4 in the prompt) and two-shot
+//      examples (§6a) showing accept (Example A) vs reject (Example B).
+//   §8 Output schema: adds is_alternative_path + alternative_path_evidence.
+//   §9 Termination: ADDS the alternative-path override — when is_alt=true
+//      and behavioral_correctness ≥ 22 and completeness ≥ 18, ok=true MUST
+//      NOT be blocked by code_quality / best_practices alone (sandbox-
+//      artifact tolerance).
+//
+// A/B validation (scripts/critic_v2_ab.py on the run-1 archive,
+// /tmp/n16_diag_archive_django__django-10914.prev_5of16 — 5 archived
+// patches with oracle truth bo6+bo8=PASS, bo5+bo10+bo15=FAIL):
+//   v1:   tp=0 fp=0 tn=3 fn=2  F1=0.00  (all 5 rejected — §9.9 baseline)
+//   v2.1: tp=2 fp=0 tn=3 fn=0  F1=1.00  (perfect)
+func buildReviewPromptV2(
+	issue, patch, fileContext, reproducerEvidence, staticEvidence, regressionEvidence string,
+	domainTier string,
+	threshold PassThreshold,
+) string {
+	const issueCap = 8000
+	const patchCap = 12000
+	const fileCtxCap = 20000
+	const evidenceCap = 6000
+	if len(issue) > issueCap {
+		issue = issue[:issueCap] + "...[truncated]"
+	}
+	if len(patch) > patchCap {
+		patch = patch[:patchCap] + "...[truncated]"
+	}
+	if len(fileContext) > fileCtxCap {
+		fileContext = fileContext[:fileCtxCap] + "\n...[truncated]"
+	}
+	if len(reproducerEvidence) > evidenceCap {
+		reproducerEvidence = reproducerEvidence[:evidenceCap] + "\n...[truncated]"
+	}
+	if len(staticEvidence) > evidenceCap {
+		staticEvidence = staticEvidence[:evidenceCap] + "\n...[truncated]"
+	}
+	if len(regressionEvidence) > evidenceCap {
+		regressionEvidence = regressionEvidence[:evidenceCap] + "\n...[truncated]"
+	}
+	if fileContext == "" {
+		fileContext = "(no modified file content collected)"
+	}
+
+	return fmt.Sprintf(`## §1 Role & Identity
+You are a senior software engineer with 20 years of experience auditing Python codebases. Your job: trace whether the patch's runtime behavior satisfies the outcome the issue describes. A patch is correct iff, on the issue's example inputs, the post-patch code produces the behavior the issue requires — REGARDLESS of which file the patch touches, which symbol it modifies, or whether the diff matches the "obvious" prescribed location. Behaviorally-equivalent alternative fixes (callsite defaults, monkey patches, decorators, upstream-layer overrides) are valid; only behaviorally-incorrect patches must be rejected.
+
+## §2 Objective & Scope
+Review ONE SWE-bench patch against ONE issue. Decide accept / revise based on traced runtime behavior. Do NOT reject solely because the patch touches a different file or symbol than the issue text names — if the behavior is satisfied, accept.
+
+## §3 Context & Constraints
+- You have one shot — no follow-up tools or clarifications.
+- Default stance: trace the patch's behavior on the issue's example inputs. Reject only when you can identify a specific input on which the post-patch code FAILS to produce the required behavior.
+- A symptom-mask (try/except swallowing the error, special-case for the example input only that doesn't generalize) is still REVISE — these don't satisfy the behavioral outcome on broader inputs.
+- Missing reproducer coverage is NOT itself REVISE — evaluate whether the diff would handle reproducer inputs correctly via inspection.
+
+## §4 Evidence (deterministic, from tools — this is ground truth)
+
+### §4.1 ISSUE TEXT
+%s
+
+### §4.2 PATCH (unified diff)
+%s
+
+### §4.3 FULL CONTENT OF MODIFIED FILES (post-patch, for ±full-file context beyond the ±3 diff window)
+%s
+
+### §4.4 REPRODUCER EXECUTION (issue's example code run against post-patch repo)
+%s
+
+### §4.5 STATIC ANALYSIS (ruff on modified files)
+%s
+
+### §4.6 RELATED PRE-EXISTING TESTS
+%s
+
+## §5 Multi-Dimensional Rubric (each 0-25, orthogonal, total 0-100)
+- **behavioral_correctness** (0-25): does the patch's runtime behavior on the issue's example inputs match what the issue requires? 25 = traced behavior matches required outcome; 10 = traced behavior fails on the example input; 0 = patch doesn't affect the relevant code path at all.
+- **completeness** (0-25): are edge cases (None, empty, boundary, negative) handled by the patched behavior?
+- **code_quality** (0-25): does the code read well, use clear names, match surrounding style?
+- **best_practices** (0-25): proper error handling, no broad except, preserved function signatures.
+
+PASS threshold (tier %[11]s):
+  - total ≥ %[7]d, AND
+  - behavioral_correctness ≥ %[8]d, AND
+  - completeness ≥ %[9]d, AND
+  - no Severity > %[10].2f issue.
+
+When the diff implements a valid alternative path (different file/symbol than the issue prescribes but produces the same observable behavior), accept it on behavioral grounds — do NOT downgrade on location.
+
+## §6 Reasoning Protocol (mandatory before the JSON verdict)
+Think step-by-step inside a <thinking> block. Within <thinking> simulate a FIVE-expert panel:
+
+- **CS-Theorist**: trace the issue's example inputs through the patched code path line by line. What output does the post-patch code produce? Does it match the issue's required outcome?
+- **Edge-Case Hunter**: list 3 inputs not in the issue but plausible (None, empty, nested, boundary, negative). Would the patched code handle them?
+- **Security Auditor**: does the patch widen an attack surface or introduce silent failures?
+- **Maintenance Reviewer**: signature / return / docstring preservation.
+- **Alternative-Path Auditor** *(new)*: independently identify whether the patch implements a behaviorally-valid alternative path. Specifically:
+    1. What location/symbol does the issue text PRESCRIBE?
+    2. What location/symbol does the PATCH actually modify?
+    3. If (1) != (2), trace whether the patch's modification produces the same observable behavior as the prescribed fix would have, on the issue's example inputs.
+    4. **Import-isolation check (v2.1)**: identify what imports / references the prescribed location. If the patched location is in a DIFFERENT module than the prescribed one and the test code / runtime path imports specifically from the prescribed module (e.g., `+"`from django.conf import global_settings; global_settings.FILE_UPLOAD_PERMISSIONS`"+`), then patching a similarly-named symbol in a different file (e.g., `+"`django/conf/settings.py`"+`) does NOT achieve the same observable behavior — set is_alternative_path=false even when the symbol name matches.
+    5. Report `+"`is_alternative_path: true | false`"+`. Set `+"`true`"+` ONLY when ALL of: (a) the patch touches a different location than prescribed, (b) the traced behavior demonstrably matches the required outcome on the example inputs, AND (c) no import-isolation barrier separates the patched location from the test / runtime path.
+    6. If `+"`is_alternative_path: true`"+`, do NOT penalize the patch on `+"`behavioral_correctness`"+` for the location mismatch.
+
+Resolve disagreement by evidence (prefer traced behavior over intuition). Close <thinking> before emitting JSON.
+
+### §6a Two-shot examples for Alternative-Path Auditor calibration
+
+**Example A — accept alternative path**:
+  Issue: "Set default FILE_UPLOAD_PERMISSIONS to 0o644 to fix world-writable uploaded files."
+  Prescribed location: global_settings.py FILE_UPLOAD_PERMISSIONS = 0o644
+  Patch (excerpt, on storage.py):
+      def file_permissions_mode(self):
+          permissions = self._value_or_setting(self._file_permissions_mode,
+                                                settings.FILE_UPLOAD_PERMISSIONS)
+   +      if permissions is None:
+   +          permissions = 0o644
+          return permissions
+  Trace: when settings.FILE_UPLOAD_PERMISSIONS is None, the new fallback substitutes 0o644. The reproducer "upload a file, check mode" observes mode=0o644. Behavior satisfied.
+  Alternative-Path Auditor: is_alternative_path=true, evidence="callsite default in storage.py achieves the same observable file mode as modifying the global constant".
+  Verdict: ok=true. behavioral_correctness=22.
+
+**Example B — reject bungled alternative path**:
+  Issue: same as Example A.
+  Patch (excerpt, on storage.py):
+      def file_permissions_mode(self):
+   +      permissions = self._value_or_setting(self._file_permissions_mode,
+   +                                            settings.FILE_UPLOAD_PERMISSIONS)
+   +      return permissions
+  Trace: the function now extracts the return value into a variable and returns it. But when settings.FILE_UPLOAD_PERMISSIONS is None, the function STILL returns None — there is no `+"`if permissions is None: permissions = 0o644`"+` fallback. The reproducer observes the file mode unchanged from baseline. Behavior NOT satisfied.
+  Alternative-Path Auditor: is_alternative_path=false (the patch APPEARS to attempt the callsite-default pattern via the variable extraction, but never implements the actual fallback — no behavioral change vs. baseline).
+  Verdict: ok=false. behavioral_correctness=8.
+
+## §7 Patch Guidance (populate only if ok=false)
+For each revise_directive: be specific (file:line), concrete ("change X to Y because the traced behavior fails on input Z"), and MINIMAL.
+
+## §8 Output Schema (extended for v2)
+Emit ONLY a JSON object:
+{
+  "ok": boolean,
+  "overall_severity": 0.0 to 1.0,
+  "summary": "one-sentence verdict",
+  "is_alternative_path": boolean,
+  "alternative_path_evidence": "one sentence — what behavior is preserved, traced through which code path",
+  "scores": {"behavioral_correctness": 0-25, "completeness": 0-25, "code_quality": 0-25, "best_practices": 0-25},
+  "issues": [{"type":"Logical|Syntax|Performance|Security|Style", "location":"file:line", "evidence":"concrete observation", "critique":"one sentence", "severity":0.0-1.0}],
+  "revise_directives": ["file:line — change X to Y because Z"]
+}
+
+## §9 Termination Heuristics
+- ok=true REQUIRES ALL of: total ≥ %[7]d, behavioral_correctness ≥ %[8]d, completeness ≥ %[9]d, no Severity > %[10].2f issue.
+- **Alternative-path override (v2.1)**: when is_alternative_path=true AND behavioral_correctness ≥ 22 AND completeness ≥ 18, ok=true MUST NOT be blocked by low code_quality or best_practices alone. Sandbox artifacts (e.g., a committed `+"`patch.diff`"+` meta-file at repo root, or other debugging clutter that doesn't affect the source behavior) reduce code_quality scores but do NOT invalidate a behaviorally-correct fix. The intent of this override is: a correct fix that ALSO leaves clutter is still a correct fix.
+- When is_alternative_path=true with sound traced evidence, behavioral_correctness MUST NOT be downgraded purely for the location mismatch.
+- When is_alternative_path=false AND the patch makes no observable behavioral change vs. baseline, ok MUST be false (Example B pattern).
+- If the Edge-Case Hunter flags a likely miss with a concrete input, ok MUST be false.
 `, issue, patch, fileContext, reproducerEvidence, staticEvidence, regressionEvidence,
 		threshold.Total, threshold.Correctness, threshold.Completeness, threshold.MaxSeverity,
 		func() string {
