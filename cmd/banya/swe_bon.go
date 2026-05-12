@@ -67,6 +67,13 @@ type bonCandidate struct {
 
 	Score int
 	Notes string
+
+	// Self-consistency weighting (paper §9.10; enabled by
+	// BANYA_SWE_BO_CONSENSUS_WEIGHTING=1). When enabled, Score is rescaled
+	// to int(raw_score * consensus_weight * 1000); ScoreRaw and
+	// ConsensusWeight preserve the originals for paper-data logging.
+	ScoreRaw        int
+	ConsensusWeight float64
 }
 
 // runBoN drives `n` independent agent samples and writes the highest-
@@ -487,11 +494,53 @@ func runBoN(
 		candidates = append(candidates, c)
 	}
 
+	// Self-consistency weighting (opt-in: BANYA_SWE_BO_CONSENSUS_WEIGHTING=1).
+	// Rescales Score in place; no-op when env var unset, so default
+	// behaviour is byte-identical to pre-v18.10 sort.
+	applyConsensusWeighting(candidates)
+	if consensusWeightingEnabled() {
+		per := make([]map[string]any, 0, len(candidates))
+		for _, c := range candidates {
+			files := editedSourceFiles(c)
+			fileList := make([]string, 0, len(files))
+			for f := range files {
+				fileList = append(fileList, f)
+			}
+			per = append(per, map[string]any{
+				"index":            c.Index,
+				"score_raw":        c.ScoreRaw,
+				"consensus_weight": c.ConsensusWeight,
+				"weighted_score":   c.Score,
+				"edited_files":     fileList,
+			})
+		}
+		emitMeta(out, map[string]any{
+			"phase":       "swe_bo_n_consensus_weights",
+			"n":           len(candidates),
+			"granularity": consensusGranularity(),
+			"per_sample":  per,
+			"session_id":  sessionID,
+		})
+	}
+
 	// Pick winner.
+	//
+	// Tiebreaker hierarchy:
+	//   1. Score (weighted_score when consensus weighting enabled).
+	//   2. ConsensusWeight (paper §9.10) — when raw scores are all 0
+	//      (e.g. all v18.1-gated to score 0), this prefers candidates
+	//      editing a "popular" target file over sandbox-only outliers.
+	//      Defaults to 0 for every candidate when consensus weighting
+	//      is disabled, so this is a no-op for legacy runs.
+	//   3. PytestPass (v18.1).
+	//   4. Index — stable across re-runs.
 	sort.SliceStable(candidates, func(i, j int) bool {
 		a, b := candidates[i], candidates[j]
 		if a.Score != b.Score {
 			return a.Score > b.Score
+		}
+		if a.ConsensusWeight != b.ConsensusWeight {
+			return a.ConsensusWeight > b.ConsensusWeight
 		}
 		if a.PytestPass != b.PytestPass {
 			return a.PytestPass

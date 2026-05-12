@@ -400,6 +400,38 @@ func runBoNViaChildren(
 		_ = copyFileForBackup(stdoutSrc, stdoutDst)
 	}
 
+	// Self-consistency weighting (opt-in: BANYA_SWE_BO_CONSENSUS_WEIGHTING=1).
+	// Mutates Score in place; default behaviour unchanged when env unset.
+	// Patch paths in `candidates[i].PatchPath` point to each child's
+	// sample-dir patch.diff (set at line ~313 above) — still on disk and
+	// readable until teardownSampleWorktree() runs after the sort.
+	applyConsensusWeighting(candidates)
+	if consensusWeightingEnabled() {
+		per := make([]map[string]any, 0, len(candidates))
+		for _, c := range candidates {
+			files := editedSourceFiles(c)
+			fileList := make([]string, 0, len(files))
+			for f := range files {
+				fileList = append(fileList, f)
+			}
+			per = append(per, map[string]any{
+				"index":            c.Index,
+				"score_raw":        c.ScoreRaw,
+				"consensus_weight": c.ConsensusWeight,
+				"weighted_score":   c.Score,
+				"edited_files":     fileList,
+			})
+		}
+		emit(map[string]any{
+			"phase":       "swe_bo_n_consensus_weights",
+			"n":           len(candidates),
+			"granularity": consensusGranularity(),
+			"per_sample":  per,
+			"session_id":  sessionID,
+			"parent_mode": "c_process",
+		})
+	}
+
 	// Pick winner using the SAME logic as sequential runBoN.
 	sortedCandidates := append([]bonCandidate{}, candidates...)
 	sortBoNCandidates(sortedCandidates)
@@ -455,6 +487,11 @@ func sortBoNCandidates(cs []bonCandidate) {
 func bonCandidateLess(a, b bonCandidate) bool {
 	if a.Score != b.Score {
 		return a.Score > b.Score
+	}
+	// Paper §9.10 — consensus weight is the score-0 tiebreaker. No-op
+	// when consensus weighting is disabled (both weights default to 0).
+	if a.ConsensusWeight != b.ConsensusWeight {
+		return a.ConsensusWeight > b.ConsensusWeight
 	}
 	if a.PytestPass != b.PytestPass {
 		return a.PytestPass
