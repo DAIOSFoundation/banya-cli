@@ -1241,14 +1241,18 @@ func refreshPatchDiff(workDir string, out *bufio.Writer) {
 			fileCount++
 		}
 	}
-	// Only overwrite when the diff is non-empty OR the file is missing —
-	// never clobber a correct patch.diff with an empty diff after a
-	// failed revise turn.
-	wrote := false
-	if len(diffOut) > 0 {
-		_ = os.WriteFile(patchPath, diffOut, 0o644)
-		wrote = true
-	}
+	// Always overwrite patch.diff with the canonical `git diff --cached`
+	// output, even when empty. Paper §9.10 v6 forensics showed the agent
+	// occasionally writes a hallucinated patch.diff via `update_file` —
+	// e.g. mwaskom__seaborn-2848 / pallets__flask-4045 where the patch
+	// header references blob hashes that exist in no commit (701f12e and
+	// 475790a respectively), and the actual workspace source is unchanged
+	// from base_commit. If the agent's source edits net to zero (revert)
+	// or never happened, patch.diff must reflect that — empty — so the
+	// harness honestly reports "patch.diff missing or empty" instead of
+	// trying to apply a fabricated diff that won't match the real source.
+	wrote := true
+	_ = os.WriteFile(patchPath, diffOut, 0o644)
 	prevBytes := int64(0)
 	if st, err := os.Stat(patchPath); err == nil {
 		prevBytes = st.Size()
