@@ -363,9 +363,26 @@ func runHeadless(cmd *cobra.Command, _ []string) error {
 		return nil
 	}
 
+	// Patch 3 — symmetry pre-scan. Regex-detect issue-text shapes that
+	// imply a symmetric fix is needed (gold patches modify TWO sites,
+	// not just the named one). On match, prepend a structurally-inserted
+	// ALERT block to the user prompt. See swe_runtime_patches.go for
+	// rationale; gated on BANYA_SWE_RUNTIME_PATCHES=1.
+	firstTurnPrompt := promptText
+	if runtimePatchesEnabled() {
+		if alert, matched := detectSymmetryAlert(promptText); alert != "" {
+			emitMeta(out, map[string]any{
+				"phase":      "symmetry_alert",
+				"matched":    matched,
+				"alert_len":  len(alert),
+			})
+			firstTurnPrompt = promptText + alert
+		}
+	}
+
 	// First turn — the agent's initial attempt.
 	sessionID, exitReason, exitCode := runOneTurn(out, pc, protocol.ChatRequest{
-		Message:    promptText,
+		Message:    firstTurnPrompt,
 		WorkDir:    workDir,
 		PromptType: protocol.PromptType(promptTypeStr),
 	}, timeout, idleAbort, thinkingAbort, autoApprove)
@@ -515,6 +532,88 @@ func runHeadless(cmd *cobra.Command, _ []string) error {
 			PytestRevised: childPytestRevised,
 			WallElapsedS:  int(time.Since(childStartedAt).Seconds()),
 		})
+	}
+
+	// Patches 1 & 2 — post-turn runtime enforcement. Both gated on
+	// BANYA_SWE_RUNTIME_PATCHES=1 so the default behaviour matches the
+	// v16 baseline exactly. Fires BEFORE the existing patch-missing
+	// nudge so we don't double-nudge.
+	//
+	// Patch 1 (cause-locus enforcement): if the agent's first
+	// update_file happened without a preceding <thought>Symptom site:/
+	// Cause site:</thought> block, hard-revert and demand the analysis
+	// before the next write. Addresses v15/v16 mode A failures
+	// (matplotlib-25433: RangeSlider patched instead of Figure.clear).
+	//
+	// Patch 2 (forced revert on thrash): if update_file count >= 3
+	// AND patch.diff exceeds 60 lines, the agent has likely committed
+	// to a sprawling-fix-at-wrong-locus path. Hard-revert and demand
+	// a SMALLER fix at a DIFFERENT location. Addresses v15/v16 mode B
+	// failures (xarray-3364: 4605-byte sprawl vs ~800-byte gold).
+	//
+	// Patch 1 takes priority over Patch 2 — fix the locus before
+	// reconsidering the shape.
+	if !wbLayout.Active() && runtimePatchesEnabled() && !nudgedThisRun && exitCode != 3 && patchExists() {
+		analysis := analyzeTrajectory(workDir)
+		emitMeta(out, map[string]any{
+			"phase":             "runtime_analysis",
+			"update_file_count": analysis.UpdateFileCount,
+			"cause_locus_seen":  analysis.CauseLocusBeforeWrite,
+			"patch_lines":       patchLineCount(workDir),
+			"has_reproducer":    analysis.HasReproducer,
+			"last_repro_errored": analysis.LastReproducerErrored,
+			"session_id":        sessionID,
+		})
+
+		causeLocusMissing := analysis.UpdateFileCount > 0 && !analysis.CauseLocusBeforeWrite
+		thrashDetected := analysis.UpdateFileCount >= 3 && patchLineCount(workDir) >= 60
+
+		if causeLocusMissing {
+			prevLines := patchLineCount(workDir)
+			revCtx, revCancel := newGitCtx(cmd.Context(), 15*time.Second)
+			_ = gitCheckoutAll(revCtx, workDir, out)
+			revCancel()
+			refreshPatchDiff(workDir, out)
+			emitMeta(out, map[string]any{
+				"phase":             "cause_locus_revert",
+				"reason":             "first_update_file_without_cause_locus_thought",
+				"patch_lines_pre":    prevLines,
+				"update_file_count":  analysis.UpdateFileCount,
+				"session_id":         sessionID,
+			})
+			issueSymbols := extractIssueSymbols(promptText)
+			fileHint := extractMostReadSourceFileValidated(workDir, issueSymbols)
+			nudgedThisRun = true
+			_, exitReason, exitCode = runOneTurn(out, pc, protocol.ChatRequest{
+				SessionID:  sessionID,
+				Message:    buildCauseLocusForcePrompt(issueSymbols, fileHint),
+				WorkDir:    workDir,
+				PromptType: protocol.PromptType(promptTypeStr),
+			}, nudgeTimeout, idleAbort, thinkingAbort, autoApprove)
+			refreshPatchDiff(workDir, out)
+		} else if thrashDetected {
+			prevLines := patchLineCount(workDir)
+			revCtx, revCancel := newGitCtx(cmd.Context(), 15*time.Second)
+			_ = gitCheckoutAll(revCtx, workDir, out)
+			revCancel()
+			refreshPatchDiff(workDir, out)
+			emitMeta(out, map[string]any{
+				"phase":             "thrash_revert",
+				"reason":             "update_file_count_>=3_and_patch_>=60_lines",
+				"patch_lines_pre":    prevLines,
+				"update_file_count":  analysis.UpdateFileCount,
+				"session_id":         sessionID,
+			})
+			issueSymbols := extractIssueSymbols(promptText)
+			nudgedThisRun = true
+			_, exitReason, exitCode = runOneTurn(out, pc, protocol.ChatRequest{
+				SessionID:  sessionID,
+				Message:    buildThrashRevertForcePrompt(issueSymbols, prevLines, analysis.UpdateFileCount),
+				WorkDir:    workDir,
+				PromptType: protocol.PromptType(promptTypeStr),
+			}, nudgeTimeout, idleAbort, thinkingAbort, autoApprove)
+			refreshPatchDiff(workDir, out)
+		}
 	}
 
 	reproducerOnlyAtTopNudge := patchHasOnlySandboxFiles(patchPath)
