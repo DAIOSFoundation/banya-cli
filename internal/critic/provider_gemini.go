@@ -32,6 +32,16 @@ type GeminiProvider struct {
 	client   *http.Client
 }
 
+// Per-attempt HTTP timeout. v8 evidence: gemini-2.5-pro intermittently
+// hangs for the full caller-side timeout (90s @ run.go:607). Setting an
+// aggressive per-attempt deadline + retries fails fast on a stalled
+// connection so a transient API hang doesn't kill a 1200s trajectory.
+// Gemini's recommendation in the v8 design review: 45s + 3 retries.
+const (
+	geminiPerAttemptTimeout = 45 * time.Second
+	geminiMaxAttempts       = 3
+)
+
 func NewGeminiProvider(apiKey, model, endpoint string, timeout time.Duration) *GeminiProvider {
 	if model == "" {
 		model = DefaultModel
@@ -42,9 +52,11 @@ func NewGeminiProvider(apiKey, model, endpoint string, timeout time.Duration) *G
 	if timeout == 0 {
 		timeout = defaultTimeout
 	}
+	// Inner HTTP client uses per-attempt deadline; outer caller's ctx
+	// still bounds total wall time across retries.
 	return &GeminiProvider{
 		APIKey: apiKey, Model: model, Endpoint: endpoint, Timeout: timeout,
-		client: &http.Client{Timeout: timeout},
+		client: &http.Client{Timeout: geminiPerAttemptTimeout},
 	}
 }
 
@@ -66,19 +78,67 @@ func (p *GeminiProvider) Review(ctx context.Context, args ReviewArgs) (string, e
 		return "", fmt.Errorf("marshal: %w", err)
 	}
 	url := fmt.Sprintf("%s/%s:generateContent?key=%s", p.Endpoint, p.Model, p.APIKey)
-	req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(payload))
-	if err != nil {
-		return "", err
+
+	// Retry loop: gemini-2.5-pro intermittently hangs/5xx's. We bound
+	// EACH attempt with geminiPerAttemptTimeout (45s) and try up to
+	// geminiMaxAttempts (3) total. Outer ctx still wins — caller's
+	// 90s deadline at run.go:607 covers the full retry window.
+	var raw []byte
+	var lastErr error
+	var statusCode int
+	for attempt := 1; attempt <= geminiMaxAttempts; attempt++ {
+		// Per-attempt context: min(remaining outer ctx, 45s).
+		attemptCtx, cancel := context.WithTimeout(ctx, geminiPerAttemptTimeout)
+		req, rerr := http.NewRequestWithContext(attemptCtx, "POST", url, bytes.NewReader(payload))
+		if rerr != nil {
+			cancel()
+			return "", rerr
+		}
+		req.Header.Set("Content-Type", "application/json")
+		resp, derr := p.client.Do(req)
+		if derr != nil {
+			cancel()
+			lastErr = fmt.Errorf("gemini call (attempt %d/%d): %w", attempt, geminiMaxAttempts, derr)
+			// Retry on context-deadline / connection errors. The outer
+			// caller ctx will terminate the loop if its deadline fires.
+			if ctx.Err() != nil {
+				return "", lastErr
+			}
+			backoff := time.Duration(attempt*3) * time.Second
+			select {
+			case <-time.After(backoff):
+				continue
+			case <-ctx.Done():
+				return "", lastErr
+			}
+		}
+		raw, _ = io.ReadAll(resp.Body)
+		statusCode = resp.StatusCode
+		resp.Body.Close()
+		cancel()
+
+		// Retry only on 5xx + 429. Permanent 4xx returns immediately.
+		if statusCode >= 500 || statusCode == 429 {
+			lastErr = fmt.Errorf("gemini http %d (attempt %d/%d): %s", statusCode, attempt, geminiMaxAttempts, truncate(string(raw), 200))
+			if attempt < geminiMaxAttempts && ctx.Err() == nil {
+				backoff := time.Duration(attempt*3) * time.Second
+				select {
+				case <-time.After(backoff):
+					continue
+				case <-ctx.Done():
+					return "", lastErr
+				}
+			}
+			return "", lastErr
+		}
+		break // success path
 	}
-	req.Header.Set("Content-Type", "application/json")
-	resp, err := p.client.Do(req)
-	if err != nil {
-		return "", fmt.Errorf("gemini call: %w", err)
+	if raw == nil {
+		return "", lastErr
 	}
-	defer resp.Body.Close()
-	raw, _ := io.ReadAll(resp.Body)
-	if resp.StatusCode >= 400 {
-		return "", fmt.Errorf("gemini http %d: %s", resp.StatusCode, truncate(string(raw), 400))
+	// 4xx (non-429) falls through to break — surface as terminal error.
+	if statusCode >= 400 {
+		return "", fmt.Errorf("gemini http %d: %s", statusCode, truncate(string(raw), 400))
 	}
 	var apiResp struct {
 		Candidates []struct {

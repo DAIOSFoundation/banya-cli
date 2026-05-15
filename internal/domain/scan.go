@@ -140,12 +140,29 @@ func Scan(root string) ScanResult {
 	// keyword scans would be too noisy — manifests are the canonical
 	// declaration surface.
 	var manifestBuf strings.Builder
-	for _, mf := range manifestBasenames {
-		// Look for manifest at root first (most common), then nested.
-		p := filepath.Join(root, mf)
-		if data, err := os.ReadFile(p); err == nil {
-			manifestBuf.Write(data)
-			manifestBuf.WriteByte('\n')
+	// SWE-bench workspace layout puts the project under `<workspace>/repo/`,
+	// so manifests at root/<mf> are absent. Probe both root AND root/repo/
+	// (and root/repo/<first-subdir>/ for nested layouts like `repo/sympy/`).
+	manifestRoots := []string{root}
+	repoSub := filepath.Join(root, "repo")
+	if fi, err := os.Stat(repoSub); err == nil && fi.IsDir() {
+		manifestRoots = append(manifestRoots, repoSub)
+		// Many SWE projects nest one more level (repo/<project>/pyproject.toml).
+		if entries, err := os.ReadDir(repoSub); err == nil {
+			for _, e := range entries {
+				if e.IsDir() && !ignoredDirs[e.Name()] {
+					manifestRoots = append(manifestRoots, filepath.Join(repoSub, e.Name()))
+				}
+			}
+		}
+	}
+	for _, mr := range manifestRoots {
+		for _, mf := range manifestBasenames {
+			p := filepath.Join(mr, mf)
+			if data, err := os.ReadFile(p); err == nil {
+				manifestBuf.Write(data)
+				manifestBuf.WriteByte('\n')
+			}
 		}
 	}
 	sig.ManifestText = strings.ToLower(manifestBuf.String())

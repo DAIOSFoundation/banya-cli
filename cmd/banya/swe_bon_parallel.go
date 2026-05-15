@@ -213,10 +213,25 @@ func runBoNViaChildren(
 	// directly which already includes effectiveTimeout + nudgeTimeout.
 	childArgs = injectTimeout(childArgs, perChildTimeout)
 
+	// Concurrency cap. BANYA_SWE_BO_PARALLEL_MAX bounds how many children
+	// run at once; remaining children wait on the semaphore. Useful when N
+	// children all hammering a shared sglang/vLLM degrade per-request
+	// throughput (e.g. 16 concurrent on 8-GPU TP=8 saturates the scheduler).
+	// Default: unbounded (all N concurrent). Set =4 for 4-wave 4-at-a-time.
+	maxConcurrent := n
+	if envM := os.Getenv("BANYA_SWE_BO_PARALLEL_MAX"); envM != "" {
+		if v, perr := strconv.Atoi(envM); perr == nil && v > 0 && v < n {
+			maxConcurrent = v
+		}
+	}
+	sem := make(chan struct{}, maxConcurrent)
+
 	startedAt := time.Now()
 	for i := 0; i < n; i++ {
 		wg.Add(1)
 		go func(idx int) {
+			sem <- struct{}{}
+			defer func() { <-sem }()
 			defer wg.Done()
 			temp := tempMin
 			if n > 1 {

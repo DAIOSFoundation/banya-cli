@@ -85,8 +85,9 @@ type openaiStreamToolCall struct {
 type openaiStreamChunk struct {
 	Choices []struct {
 		Delta struct {
-			Content   string                 `json:"content"`
-			ToolCalls []openaiStreamToolCall `json:"tool_calls,omitempty"`
+			Content          string                 `json:"content"`
+			ReasoningContent string                 `json:"reasoning_content,omitempty"`
+			ToolCalls        []openaiStreamToolCall `json:"tool_calls,omitempty"`
 		} `json:"delta"`
 		FinishReason *string `json:"finish_reason"`
 	} `json:"choices"`
@@ -145,17 +146,20 @@ func (c *LLMServerClient) Chat(ctx context.Context, params protocol.LlmChatParam
 		model = params.Model
 	}
 
-	// SWE-bench preset (BANYA_SWE_BENCH=1) overrides sampling for
-	// deterministic-leaning output. Code/diff generation is much more
-	// reliable at low temperature; lower top_p further trims long-tail
-	// drift into analysis prose. Caller-provided params are ignored when
-	// the env flag is set so harness-side settings stay consistent across
-	// the run.
+	// SWE-bench preset (BANYA_SWE_BENCH=1) overrides sampling.
+	//
+	// v11 finding #4: previous 0.1/0.1 was nearly deterministic —
+	// matplotlib-18869 produced byte-identical patches across v7/v8
+	// (4-run identical fail), implying retries gained zero benefit
+	// from sampling. Bumped to 0.3/0.7 to inject some exploration while
+	// keeping diff syntax reliable. This restores variance between
+	// retries without sliding into the prose-drift regime > 0.5
+	// historically caused.
 	temperature := pickFloat(params.Temperature, 0.7)
 	topP := pickFloat(params.TopP, 0.95)
 	if os.Getenv("BANYA_SWE_BENCH") == "1" {
-		temperature = 0.1
-		topP = 0.1
+		temperature = 0.3
+		topP = 0.7
 	}
 	// BO@N override (Strategy b+): when banya-cli's runBoN sets
 	// BANYA_SWE_BO_TEMPERATURE / BANYA_SWE_BO_TOP_P per sample, those win
@@ -256,8 +260,9 @@ func (c *LLMServerClient) Chat(ctx context.Context, params protocol.LlmChatParam
 			Choices []struct {
 				FinishReason *string `json:"finish_reason"`
 				Message      struct {
-					Content   string                 `json:"content"`
-					ToolCalls []openaiStreamToolCall `json:"tool_calls,omitempty"`
+					Content          string                 `json:"content"`
+					ReasoningContent string                 `json:"reasoning_content,omitempty"`
+					ToolCalls        []openaiStreamToolCall `json:"tool_calls,omitempty"`
 				} `json:"message"`
 			} `json:"choices"`
 		}
@@ -283,6 +288,16 @@ func (c *LLMServerClient) Chat(ctx context.Context, params protocol.LlmChatParam
 				Name:      tc.Function.Name,
 				Arguments: tc.Function.Arguments,
 			})
+		}
+		// v11 P1: preserve reasoning_content. sglang's `--reasoning-parser qwen3`
+		// strips the model's <think>...</think> block out of `content` and
+		// surfaces it as `reasoning_content`. v10 evidence: 42.4% of action
+		// turns had no `<think>`/`<thought>` tag in trajectory because of
+		// this strip. If reasoning was emitted, prepend it back to content
+		// as a `<think>` block so downstream banya-core / trajectory log
+		// preserves it for next-turn context.
+		if ch.Message.ReasoningContent != "" {
+			ch.Message.Content = "<think>" + ch.Message.ReasoningContent + "</think>\n" + ch.Message.Content
 		}
 		// Fallback: vLLM's qwen3_coder tool-call-parser sometimes returns
 		// the model's raw XML in `content` with `tool_calls` empty under
@@ -314,6 +329,10 @@ func (c *LLMServerClient) Chat(ctx context.Context, params protocol.LlmChatParam
 
 	var content strings.Builder
 	var finish string
+	// v11 P1: track whether a <think> block is currently open (streaming
+	// reasoning_content tokens arrive interleaved with normal content;
+	// we wrap them in <think>...</think> so banya-core sees the trace).
+	reasoningOpen := false
 	toolAcc := map[int]*protocol.LlmToolCall{}
 
 	reader := bufio.NewReader(resp.Body)
@@ -340,7 +359,32 @@ func (c *LLMServerClient) Chat(ctx context.Context, params protocol.LlmChatParam
 		if len(chunk.Choices) == 0 {
 			continue
 		}
+		// v11 P1: preserve streaming reasoning_content. Wrap incoming
+		// reasoning chunks in <think> tags so the assembled trajectory
+		// has them visible to next-turn context. We accumulate the
+		// reasoning content into the same `content` buffer (prepended
+		// to non-reasoning content) — the final trajectory record will
+		// have `<think>...</think>\n<actual text>` order.
+		if rtok := chunk.Choices[0].Delta.ReasoningContent; rtok != "" {
+			if !reasoningOpen {
+				content.WriteString("<think>")
+				reasoningOpen = true
+			}
+			content.WriteString(rtok)
+			if onToken != nil {
+				if cbErr := onToken(rtok); cbErr != nil {
+					return content.String(), finish, collectToolCalls(toolAcc), cbErr
+				}
+			}
+		}
 		if tok := chunk.Choices[0].Delta.Content; tok != "" {
+			if reasoningOpen {
+				content.WriteString("</think>\n")
+				reasoningOpen = false
+				if onToken != nil {
+					_ = onToken("</think>\n")
+				}
+			}
 			content.WriteString(tok)
 			if onToken != nil {
 				if cbErr := onToken(tok); cbErr != nil {
@@ -368,6 +412,10 @@ func (c *LLMServerClient) Chat(ctx context.Context, params protocol.LlmChatParam
 			finish = *fr
 			break
 		}
+	}
+	// Close any unterminated <think> block (stream ended before content arrived).
+	if reasoningOpen {
+		content.WriteString("</think>\n")
 	}
 	finalContent := content.String()
 	finalTools := collectToolCalls(toolAcc)

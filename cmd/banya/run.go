@@ -223,6 +223,15 @@ func runHeadless(cmd *cobra.Command, _ []string) error {
 		// investigation slack and one extra critic round to compensate
 		// for the lack of priors. The multipliers are conservative —
 		// validated/high-tier work is unaffected.
+		//
+		// Note: BANYA_SWE_BENCH=1 used to force tier="high" here. That
+		// REGRESSED v7 smoke (5/10 → 4/10) because tier=high cancels
+		// the 1.5x budget bonus tier=none gives. SWE-bench tasks empirically
+		// need that bonus (flask v6 PASS@1299s/114tools regressed to FAIL
+		// at 439s when forced to tier=high). Reverted: let the static
+		// classifier pick the tier; with improvement #2 (Scan reads
+		// repo/<project>/ manifests) it correctly identifies the repo
+		// domain. The scaling stays conservative for unfamiliar layouts.
 		timeout, idleAbort, criticMaxRounds = scaleBudgetForTier(
 			domScan.Tier,
 			domScan.Top != nil && domScan.Top.Domain.HasValidation(),
@@ -1585,8 +1594,10 @@ func buildNudgePromptWithSymbols(symbols []string, fileHint string, reproducerOn
 			"real source edit now."
 	}
 
-	return "STOP. Your previous turn finished without producing patch.diff (or with patch.diff EMPTY — " +
-		"0 bytes) — that is an automatic 0.\n" +
+	// v15 SOFT NUDGE: replace punitive opener with prescriptive directive.
+	return "Your previous turn produced no source edit, so `patch.diff` is empty. " +
+		"This is recoverable — make ONE update_file call now on the file you've been " +
+		"reading.\n" +
 		symbolHint +
 		"\n" +
 		"Diagnosis hint: an empty patch.diff usually means you ran `git diff --cached` BEFORE staging " +
