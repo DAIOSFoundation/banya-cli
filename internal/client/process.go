@@ -131,10 +131,28 @@ func NewProcessClient(binPath string) (*ProcessClient, error) {
 // ResolveSidecarPath locates the banya-core sidecar binary using, in order:
 //  1. explicit argument
 //  2. BANYA_CORE_BIN env var
-//  3. $XDG_DATA_HOME/banya/bin/banya-core-<os>-<arch>
-//  4. banya-core-<os>-<arch> on PATH
-//  5. banya-core on PATH
-//  6. embedded sidecar → auto-extracted to $XDG_DATA_HOME/banya/bin
+//  3. embedded sidecar (auto-extracted to $XDG_DATA_HOME/banya/bin
+//     when missing OR when checksum differs from embed — keeps the XDG
+//     cache aligned with the binary built into this cli)
+//  4. $XDG_DATA_HOME/banya/bin/banya-core-<os>-<arch> (only when no
+//     embed bundle exists — e.g. user-installed sidecar in a non-embed
+//     build)
+//  5. banya-core-<os>-<arch> on PATH
+//  6. banya-core on PATH
+//
+// Priority change (2026-05-16, v48 incident): embedded promoted above
+// XDG. Previously the XDG cache was checked first and returned as soon
+// as a file existed there, regardless of staleness. After a banya-cli
+// rebuild the XDG cache could be from a *previous* embed (different
+// content, same path). Symptom: v48 launched with new banya-core source
+// changes (AUTHORITATIVE preamble injection, plan.md removal) but the
+// sidecar at runtime was v44-era (no AUTHORITATIVE, expecting plan.md
+// pre-seed) — entire 7-task round produced uninterpretable results
+// because the binary running diverged from the source we'd just
+// modified. InstallEmbeddedSidecar already does a SHA256 check and
+// re-writes when content differs, so checking embedded first is safe;
+// the only cost is a hash op per banya-cli invocation, which is
+// negligible vs the previously-silent "stale sidecar" class of bugs.
 func ResolveSidecarPath(explicit string) (string, error) {
 	if explicit != "" {
 		if _, err := os.Stat(explicit); err == nil {
@@ -149,9 +167,14 @@ func ResolveSidecarPath(explicit string) (string, error) {
 		return "", fmt.Errorf("BANYA_CORE_BIN=%s does not exist", env)
 	}
 
+	// Embedded bundle FIRST (refreshes XDG cache when content differs).
+	if p, err := InstallEmbeddedSidecar(); err == nil {
+		return p, nil
+	}
+
 	binName := platformBinaryName()
 
-	// XDG data dir
+	// XDG data dir — only reached when no embedded bundle exists.
 	dataDir := os.Getenv("XDG_DATA_HOME")
 	if dataDir == "" {
 		if home, err := os.UserHomeDir(); err == nil {
@@ -170,11 +193,6 @@ func ResolveSidecarPath(explicit string) (string, error) {
 		return p, nil
 	}
 	if p, err := exec.LookPath("banya-core"); err == nil {
-		return p, nil
-	}
-
-	// Embedded bundle (extract once to XDG data dir).
-	if p, err := InstallEmbeddedSidecar(); err == nil {
 		return p, nil
 	}
 
