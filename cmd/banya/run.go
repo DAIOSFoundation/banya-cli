@@ -77,6 +77,12 @@ Intended for eval harnesses that drive the agent programmatically.`,
 	cmd.Flags().Float64("swe-bo-temp-max", 1.0, "BO@N: maximum temperature across samples. Default 1.0.")
 	cmd.Flags().Int("swe-bo-revise-rounds", 1, "BO@N per-sample revise budget: 0 = pure BO@N (no per-sample revise), 1 = b+ default (1 critic-revise + 1 pytest-revise per sample), 2+ = aggressive polishing per sample.")
 	cmd.Flags().Duration("swe-bo-per-sample-timeout", 0, "BO@N per-sample timeout (default 0 = auto: overall --timeout / N, with 60s floor). Without this, sample 0 can monopolise the whole task budget and starve later samples — observed empirically.")
+	// Scaffold selector for agent mode (ignored when --prompt-type != agent).
+	// `general` = banya's default 7-step SWE-bench scaffold (free-form, backward compat).
+	// `swe`     = new 5-phase enforced scaffold matching GRPO dense-reward design
+	//             (parse / grep / file / function / harness). Sets BANYA_SWE_BENCH=1
+	//             + BANYA_SWE_SCAFFOLD=swe under the hood.
+	cmd.Flags().String("scaffold", "general", "Agent scaffold (only effective with --prompt-type agent): general | swe")
 	return cmd
 }
 
@@ -113,6 +119,14 @@ func runHeadless(cmd *cobra.Command, _ []string) error {
 		}
 	}
 	promptTypeStr, _ := cmd.Flags().GetString("prompt-type")
+	// Validate --scaffold: must be in {general, swe}, and only meaningful with --prompt-type agent.
+	scaffoldStr, _ := cmd.Flags().GetString("scaffold")
+	if scaffoldStr != "general" && scaffoldStr != "swe" {
+		return fmt.Errorf("invalid --scaffold %q: must be 'general' or 'swe'", scaffoldStr)
+	}
+	if scaffoldStr != "general" && promptTypeStr != "agent" {
+		return fmt.Errorf("--scaffold %q requires --prompt-type agent (got %q)", scaffoldStr, promptTypeStr)
+	}
 	timeout, _ := cmd.Flags().GetDuration("timeout")
 	idleAbort, _ := cmd.Flags().GetDuration("idle-abort")
 	autoApprove, _ := cmd.Flags().GetBool("auto-approve")
@@ -297,6 +311,12 @@ func runHeadless(cmd *cobra.Command, _ []string) error {
 	// non-classified runs don't pollute the env.
 	if vs := domainEnvVars(domScan); len(vs) > 0 {
 		env = append(env, vs...)
+	}
+	// Propagate --scaffold selection to sidecar. `general` (default) emits
+	// nothing — preserves backward-compat. `swe` activates SWE mode (which
+	// pickSWEBenchScaffold reads) + selects the new 5-phase scaffold variant.
+	if scaffoldStr == "swe" {
+		env = append(env, "BANYA_SWE_BENCH=1", "BANYA_SWE_SCAFFOLD=swe")
 	}
 	if len(env) > 0 {
 		pc.SetExtraEnv(env)
